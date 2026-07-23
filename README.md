@@ -128,6 +128,8 @@ Exit the installer back to the cmd prompt
 
 **“Phone” = WiFi Device connected to the ACPU_Device**
 
+An expanded version of this guide is available at www.digislides.co.uk
+
 For the rest of this guide I will refer to the device running the Linux AccessPopup script as the **“ACPU_Device”** so this will be the Raspberry Pi or other Single Board Computer or a Linux Laptop.
 The device connecting to the ACPU_Device over Wifi, either directly to the Access Point or via another Wifi Network as a **“Phone”**. This can be any wifi capable device.
 
