@@ -259,9 +259,9 @@ install_web()
 	fi
 	echo ""
 	echo -e $YEL"The web app has been installed."
-	echo "In a web browser use http://localhost:8052 on this device or"
-	echo -e "from another device use the http://ip_address:8052 or the http://hostname:8052"
-	echo -e "From devices connected to the Access Point use http://192.168.50.5:8052" $DEF
+	echo "In a web browser use http://localhost:8080 on this device or"
+	echo -e "from another device use the http://ip_address:8080 or the http://hostname:8080"
+	echo -e "From devices connected to the Access Point use http://192.168.50.1:8080" $DEF
 	read -p "Press any key to continue"
 }
 
@@ -956,8 +956,7 @@ fi
 add_permissions()
 {
 # Create sudoers file with restricted privileges
-
-echo "apu ALL=(ALL) NOPASSWD: /usr/bin/nmcli, /usr/sbin/iw, /usr/bin/tee, /etc/accesspopup.conf, /usr/local/bin/accesspopup" > "$sudoers_file"
+echo "apu ALL=(ALL) NOPASSWD: /usr/bin/nmcli, /usr/sbin/iw, /usr/bin/tee /etc/accesspopup.conf, /usr/local/bin/accesspopup" > "$sudoers_file"
 chmod 440 "$sudoers_file"
 
 if visudo -cf "$sudoers_file"; then
