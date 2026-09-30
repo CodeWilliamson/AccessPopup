@@ -80,21 +80,27 @@ class WiFiManager:
         return fields
 
     def list_profiles(self) -> List[Dict]:
-        result = self._run("-t", "-f", "UUID,NAME,TYPE,AUTOCONNECT-PRIORITY", "connection", "show")
+        result = self._run("-t", "-f", "UUID,NAME,TYPE,AUTOCONNECT-PRIORITY,ACTIVE", "connection", "show")
         profiles = []
         for line in result.stdout.splitlines():
             parts = self._split_terse(line)
-            if len(parts) != 4:
+            if len(parts) != 5:
                 continue
-            uuid, name, conn_type, priority = parts
+            uuid, name, conn_type, priority, active = parts
             if conn_type != "802-11-wireless" or name in (self.ap_connection, self.CANDIDATE_NAME):
+                continue
+            if self._is_access_point(uuid):
                 continue
             try:
                 priority_value = int(priority)
             except ValueError:
                 priority_value = 0
-            profiles.append({"uuid": uuid, "name": name, "priority": priority_value})
+            profiles.append({"uuid": uuid, "name": name, "priority": priority_value, "active": active == "yes"})
         return sorted(profiles, key=lambda p: (-p["priority"], p["name"].lower()))
+
+    def _is_access_point(self, uuid: str) -> bool:
+        result = self._run("-g", "802-11-wireless.mode", "connection", "show", "uuid", uuid, check=False)
+        return result.stdout.strip() == "ap"
 
     def _get_profile(self, uuid: str) -> Dict:
         for profile in self.list_profiles():

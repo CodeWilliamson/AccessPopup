@@ -66,7 +66,7 @@ function setBusy(busy) {
   rescanButton.disabled = busy;
   network.disabled = busy;
   password.disabled = busy;
-  profilesList.querySelectorAll('button, input').forEach(el => { el.disabled = busy; });
+  profilesList.querySelectorAll('button, input').forEach(el => { el.disabled = busy || el.classList.contains('connected'); });
   spinner.classList.toggle('hidden', !busy);
 }
 function updatePasswordVisibility() {
@@ -182,7 +182,9 @@ function renderProfiles(profiles) {
     const actions = document.createElement('div');
     actions.className = 'profile-actions';
     actions.append(
-      makeButton('Connect', 'primary', () => connectProfile(profile)),
+      profile.active
+        ? Object.assign(makeButton('Connected', 'connected', () => {}), {disabled: true})
+        : makeButton('Connect', 'primary', () => connectProfile(profile)),
       makeButton('Edit', 'secondary', () => form.classList.toggle('hidden')),
       makeButton('Delete', 'danger', () => deleteProfile(profile)),
     );
