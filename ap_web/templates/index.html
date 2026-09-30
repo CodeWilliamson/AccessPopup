@@ -1,0 +1,139 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <title>HammerTime Wi-Fi Setup</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+  <main class="card">
+    <header>
+      <img src="{{ url_for('static', filename='raspberry_pi_logo.svg') }}" alt="Raspberry Pi Logo" width="64" height="64">
+      <div>
+        <h1>Wi-Fi Setup</h1>
+        <p>Connect Raspberry Pi to Wi-Fi</p>
+      </div>
+    </header>
+
+    <section id="message" class="message hidden"></section>
+
+    <label for="network">Wi-Fi network</label>
+    <select id="network">
+      <option value="">Scanning...</option>
+    </select>
+
+    <div id="security-row">
+      <label for="password">Password</label>
+      <input id="password" type="password" autocomplete="current-password" placeholder="Enter Wi-Fi password">
+    </div>
+
+    <button id="connect" class="primary">Connect</button>
+    <button id="rescan" class="secondary">Rescan networks</button>
+
+    <div id="spinner" class="spinner hidden" aria-live="polite">
+      <span></span> Connecting…
+    </div>
+
+    <p class="footnote">The Wi-Fi profile is only kept if the connection succeeds.</p>
+  </main>
+
+<script>
+const network = document.getElementById('network');
+const password = document.getElementById('password');
+const connectButton = document.getElementById('connect');
+const rescanButton = document.getElementById('rescan');
+const message = document.getElementById('message');
+const spinner = document.getElementById('spinner');
+
+function showMessage(text, kind='error') {
+  message.textContent = text;
+  message.className = `message ${kind}`;
+}
+function clearMessage() {
+  message.textContent = '';
+  message.className = 'message hidden';
+}
+function setBusy(busy) {
+  connectButton.disabled = busy;
+  rescanButton.disabled = busy;
+  network.disabled = busy;
+  password.disabled = busy;
+  spinner.classList.toggle('hidden', !busy);
+}
+function updatePasswordVisibility() {
+  const selected = network.options[network.selectedIndex];
+  const open = selected && selected.dataset.security === 'Open';
+  document.getElementById('security-row').style.display = selected && selected.value ? 'block' : 'none';
+  password.placeholder = open ? 'No password required' : 'Enter Wi-Fi password';
+  if (open) password.value = '';
+}
+
+async function loadNetworks(force=false) {
+  clearMessage();
+  network.innerHTML = '<option value="">Scanning...</option>';
+  try {
+    const response = await fetch(force ? '/api/rescan' : '/api/networks', {method: force ? 'POST' : 'GET'});
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || 'Unable to scan for networks.');
+
+    network.innerHTML = '';
+    if (!data.networks.length) {
+      network.innerHTML = '<option value="">No networks found</option>';
+      updatePasswordVisibility();
+      return;
+    }
+
+    for (const item of data.networks) {
+      const option = document.createElement('option');
+      option.value = item.ssid;
+      option.dataset.security = item.security;
+      const lock = item.security && item.security !== 'Open' ? ' 🔒' : '';
+      option.textContent = `${item.ssid}  (${item.signal}%)${lock}`;
+      network.appendChild(option);
+    }
+    updatePasswordVisibility();
+  } catch (error) {
+    network.innerHTML = '<option value="">Unable to scan</option>';
+    showMessage(error.message);
+  }
+}
+
+network.addEventListener('change', updatePasswordVisibility);
+rescanButton.addEventListener('click', () => loadNetworks(true));
+
+connectButton.addEventListener('click', async () => {
+  const ssid = network.value;
+  if (!ssid) {
+    showMessage('Please select a Wi-Fi network.');
+    return;
+  }
+
+  clearMessage();
+  setBusy(true);
+  try {
+    const response = await fetch('/api/connect', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ssid, password: password.value})
+    });
+    const data = await response.json();
+
+    if (data.success) {
+      showMessage(`Connected to ${data.ssid}. HammerTime is switching to the rink Wi-Fi.`, 'success');
+      setTimeout(() => { window.location.href = 'http://' + data.ip + '/'; }, 2500);
+    } else {
+      showMessage(data.error || 'Connection failed. Please check the password and try again.');
+      setBusy(false);
+      await loadNetworks(false);
+    }
+  } catch (error) {
+    showMessage('The connection attempt could not be completed. The access point should still be available.');
+    setBusy(false);
+  }
+});
+
+loadNetworks();
+</script>
+</body>
+</html>

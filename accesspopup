@@ -18,6 +18,7 @@ ap_ssid='AccessPopup'
 ap_pw='1234567890'
 ap_ip='192.168.50.5/24'
 ap_gate='192.168.50.254'
+ap_channel='1'
 
 #If wifi is disabled in Network Manager, then enable it automatically.
 #if set to 'n' then wifi will stay off and no AccessPoint will be generated or Network Connection will be available.
@@ -319,7 +320,7 @@ sleep 3 #give time for the update on a slow Pi Zero W before checking all is ok.
 ap_new_profile()
 {
 #Create a AP profile
-nmcli device wifi hotspot ifname $wdev0 con-name "$ap_profile_name" ssid "$ap_ssid" band bg channel 6 password "$ap_pw" >/dev/null 2>&1
+nmcli device wifi hotspot ifname $wdev0 con-name "$ap_profile_name" ssid "$ap_ssid" band bg channel "$ap_channel" password "$ap_pw" >/dev/null 2>&1
 nmcli connection modify "$ap_profile_name" ipv4.method shared ipv4.addr "$ap_ip" ipv4.gateway "$ap_gate" 802-11-wireless-security.group "ccmp" 802-11-wireless-security.pairwise "ccmp" 802-11-wireless-security.proto "rsn" >/dev/null 2>&1
 nmcli connection modify "$ap_profile_name" wifi.powersave disable
 ap_profile+="$ap_profile_name"

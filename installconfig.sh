@@ -14,9 +14,8 @@ script_path="/usr/local/bin/"
 scriptname="accesspopup"
 conf_path="/etc/"
 conf_file="accesspopup.conf"
-web_path="/usr/local/bin/acpu_web"
-webfile_acpu="/usr/local/bin/acpu_web/acpu_get_std.py"
-webfile_app="/usr/local/bin/acpu_web/pages/app.py"
+web_path="/usr/local/bin/ap_web"
+webfile_app="/usr/local/bin/ap_web/app.py"
 active_ap="n"
 active=""
 nw_profile=()
@@ -25,10 +24,8 @@ nw_profile=()
 sysd_path="/etc/systemd/system/"
 service=AccessPopup.service
 timer=AccessPopup.timer
-webback=acpu_web.service
-webappsock=acpu_web_app.socket
-webapp=acpu_web_app.service
-sudoers_file="/etc/sudoers.d/acpu"
+webapp=ap_web_app.service
+sudoers_file="/etc/sudoers.d/apu"
 
 #Text Format
 YEL='\e[38;2;255;255;0m'
@@ -111,95 +108,37 @@ systemctl daemon-reload
 fi
 }
 
-add_web_back_service()
-{
-if ! systemctl list-unit-files --all | grep $webback ;then
-	cat > "${sysd_path}${webback}" <<EOF
-[Unit]
-Description=AccessPopup Webpage background actions script
-After=network.target
-
-[Service]
-Type=simple
-
-# Run as the restricted user
-User=acpu
-Group=acpu
-
-# Run Backend Script
-ExecStart=/usr/local/bin/acpu_web/venv/bin/python3 /usr/local/bin/acpu_web/acpu_get_std.py
-
-# Restart on failure
-Restart=on-failure
-RestartSec=5
-TimeoutStopSec=10
-KillMode=control-group
-
-#Working dir
-WorkingDirectory=/usr/local/bin
-
-#Security
-ProtectSystem=full
-ReadWritePaths=/etc/accesspopup.conf
-ReadOnlyPaths=/usr/local/bin/acpu_web
-
-[Install]
-WantedBy=multi-user.target
-
-EOF
-systemctl daemon-reload
-systemctl enable $webback >/dev/null 2>&1
-fi
-}
-
 add_web_app_service()
 {
 if ! systemctl list-unit-files --all | grep $webapp ;then
 	cat > "${sysd_path}${webapp}" <<EOF
 [Unit]
-Description=ACPU Web Server for AccessPopup
-Requires=acpu_web_app.socket
-After=network.target
-Wants=acpu_web.service
-After=acpu_web.service
+Description=HammerTime Wi-Fi Provisioning Portal
+After=NetworkManager.service
+Wants=NetworkManager.service
 
 [Service]
-User=acpu
-Group=acpu
-
-WorkingDirectory=/usr/local/bin/acpu_web/pages
-ExecStart=/usr/local/bin/acpu_web/venv/bin/uvicorn app:app --fd 3
-
+Type=simple
+User=apu
+Group=apu
+WorkingDirectory=/usr/local/bin/ap_web
+Environment=WIFI_INTERFACE=wlan0
+Environment=AP_CONNECTION=HammerTime AP
+Environment=WIFI_CONNECT_TIMEOUT=25
+Environment=PORTAL_HOST=0.0.0.0
+Environment=PORTAL_PORT=8080
+ExecStart=/usr/local/bin/ap_web/venv/bin/python /usr/local/bin/ap_web/app.py
 Restart=on-failure
 RestartSec=5
 
-Environment=PYTHONUNBUFFERED=1
+# nmcli needs root privileges for connection provisioning.
+NoNewPrivileges=false
 
 [Install]
 WantedBy=multi-user.target
 EOF
 fi
 }
-
-
-add_web_app_socket()
-{
-if ! systemctl list-unit-files --all | grep $webappsock ;then
-	cat > "${sysd_path}${webappsock}" <<EOF
-[Unit]
-Description=Socket for AccessPopup Webpage actions script
-
-[Socket]
-ListenStream=0.0.0.0:8052
-
-[Install]
-WantedBy=sockets.target
-EOF
-systemctl daemon-reload
-systemctl enable $webappsock
-fi
-}
-
 
 
 webcheck()
@@ -212,10 +151,10 @@ if [ ! -f "$script_path$scriptname" ]; then
 fi
  echo "Web Interface Setup"
  #does systemctl acpu_web_app exist - no - install websetup
-if ! systemctl list-unit-files --all | grep "$webback" || [ ! -d "$web_path" ] >/dev/null 2>&1; then
+if ! systemctl list-unit-files --all | grep "$webapp" || [ ! -d "$web_path" ] >/dev/null 2>&1; then
 	echo "The Web Interface not currently Installed, Installing files"
 	install_web
-elif systemctl -all list-unit-files "$webback" | grep "$webback enabled" >/dev/null 2>&1;then
+elif systemctl -all list-unit-files "$webapp" | grep "$webapp enabled" >/dev/null 2>&1;then
 	echo "Disabling the Web Interface"
 	disable_web
 	echo "The Web app has been disabled"
@@ -279,12 +218,10 @@ install_web()
 
 	install_list=(
 		"mkdir \"$web_path\""
-		"cp -rf \"${cpath}acpu_web/.\" \"$web_path\""
+		"cp -rf \"${cpath}ap_web/.\" \"$web_path\""
 		"python3 -m venv \"$web_path/venv\""
 		"\"$web_path/venv/bin/pip\" install -r \"$web_path/requirements.txt\" && \"$web_path/venv/bin/pip\" check"
-		"cp \"${cpath}acpu_web/acpu_get_std.py\" \"$web_path\""
-		"chmod 755 \"$web_path/acpu_get_std.py\""
-		"chmod 755 \"$web_path/pages/app.py\""
+		"chmod 755 \"$web_path/app.py\""
 	)
 
 	if [ ! -d "$web_path" ] ; then #web_path doesn't exist
@@ -292,12 +229,9 @@ install_web()
 		if [ $? = 0 ];then
 			if add_permissions ;then
 				echo "Add services"
-				add_web_back_service #add background actions service
 				add_web_app_service #add web app service
-				add_web_app_socket #add web app socket
 				systemctl daemon-reload
-				systemctl start $webback
-				systemctl start $webappsock
+				systemctl start $webapp
 			else
 				echo "Unable to set sudoers permissions"
 				echo "Unable to complete the setup of the Web files."
@@ -312,18 +246,15 @@ install_web()
 	else #web_path exists, check other files
 		echo "script Path is $cpath"
 		echo "Checking that the required files are in place"
-		if comm -23 <(cd ${cpath}acpu_web/ && find . -type f | sort) <(cd $web_path && find . -type f | sort) | grep . ; then
-			echo "Some files from ${cpath}acpu_web/ are missing in $web_path"
+		if comm -23 <(cd ${cpath}ap_web/ && find . -type f | sort) <(cd $web_path && find . -type f | sort) | grep . ; then
+			echo "Some files from ${cpath}ap_web/ are missing in $web_path"
 			echo "re-installing files"
 
-			cp "${cpath}acpu_get_std.py" "$web_path"
-			chmod +x "${web_path}/acpu_get_std.py"
-			add_web_back_service #add actions service
+			cp "${cpath}ap_get_std.py" "$web_path"
+			chmod +x "${web_path}/ap_get_std.py"
 			add_web_app_service #add web app service
-			add_web_app_socket #add web app socket
 			systemctl daemon-reload
-			systemctl start $webback
-			systemctl start $webappsock
+			systemctl start $webapp
 		fi
 	fi
 	echo ""
@@ -337,13 +268,10 @@ install_web()
 disable_web()
 {
 #check if services are running, and disable them
-if systemctl -all list-unit-files "$webback" | grep "${webback} enabled" >/dev/null 2>&1 ;then
+if systemctl -all list-unit-files "$webapp" | grep "${webapp} enabled" >/dev/null 2>&1 ;then
 	echo "The Web App is currently enabled, stopping and disabling Web Services"
-	systemctl stop "$webappsock" >/dev/null 2>&1
 	systemctl stop "$webapp" >/dev/null 2>&1
-	systemctl stop "$webback" >/dev/null 2>&1
-	systemctl disable "$webappsock" >/dev/null 2>&1
-	systemctl disable "$webback" >/dev/null 2>&1
+	systemctl disable "$webapp" >/dev/null 2>&1
 	systemctl daemon-reload >/dev/null 2>&1
 
 fi
@@ -352,16 +280,14 @@ fi
 enable_web()
 {
 #enable web services if they exist
-w="$(systemctl -all list-unit-files "$webback")"
+w="$(systemctl -all list-unit-files "$webapp")"
 if [ $? -gt 0 ] ;then #not installed
 	echo "Web files do not exist. The Web app will be installed."
 	install_web
-elif systemctl -all list-unit-files "$webback" | grep "${webback} disabled" >/dev/null 2>&1 ;then
+elif systemctl -all list-unit-files "$webapp" | grep "${webapp} disabled" >/dev/null 2>&1 ;then
 	echo "Enabeling AccessPopup Web app"
-	systemctl enable "$webback" >/dev/null 2>&1
-	systemctl enable "$webappsock" >/dev/null 2>&1
-	systemctl start "$webback" >/dev/null 2>&1
-	systemctl start "$webappsock" >/dev/null 2>&1
+	systemctl enable "$webapp" >/dev/null 2>&1
+	systemctl start "$webapp" >/dev/null 2>&1
 fi
 }
 
@@ -1021,9 +947,9 @@ devices()
 create_user()
 {
 # Create a dedicated system user without login shell
-if ! id -u acpu >/dev/null 2>&1; then
-    echo "Creating acpu system user..."
-    useradd -r -s /usr/sbin/nologin -d /nonexistent acpu
+if ! id -u apu >/dev/null 2>&1; then
+    echo "Creating apu system user..."
+    useradd -r -s /usr/sbin/nologin -d /nonexistent apu
 fi
 }
 
@@ -1031,14 +957,14 @@ add_permissions()
 {
 # Create sudoers file with restricted privileges
 
-echo "acpu ALL=(ALL) NOPASSWD: /usr/bin/nmcli, /usr/sbin/iw, /usr/bin/tee, /etc/accesspopup.conf, /usr/local/bin/accesspopup" > "$sudoers_file"
+echo "apu ALL=(ALL) NOPASSWD: /usr/bin/nmcli, /usr/sbin/iw, /usr/bin/tee, /etc/accesspopup.conf, /usr/local/bin/accesspopup" > "$sudoers_file"
 chmod 440 "$sudoers_file"
 
 if visudo -cf "$sudoers_file"; then
     echo "Sudoers file validated successfully."
-    #add acpu user
-	if ! id acpu >/dev/null 2>&1; then
-		useradd --system --no-create-home --shell /usr/sbin/nologin acpu
+    #add apu user
+	if ! id apu >/dev/null 2>&1; then
+		useradd --system --no-create-home --shell /usr/sbin/nologin apu
 	fi
 	return 0
 else
@@ -1119,24 +1045,19 @@ uninstall_web()
 	fi
 	#remove systemd services
 	if systemctl -all list-unit-files $webback | grep $webback ;then
-		systemctl stop $webappsock
 		systemctl stop $webapp
-		systemctl stop $webback
-		systemctl disable $webappsock
-		systemctl disable $webback
+		systemctl disable $webapp
 		systemctl daemon-reload
 		rm /etc/systemd/system/$webapp
-		rm /etc/systemd/system/$webappsock
-		rm /etc/systemd/system/$webback
 	fi
 	#remove visudo file
 	if [ -f $sudoers_file ]; then
 		rm -r $sudoers_file >/dev/null 2>&1
 	fi
-	#remove acpu user
-	if id acpu ; then
-		delgroup acpu >/dev/null 2>&1
-		deluser acpu >/dev/null 2>&1
+	#remove apu user
+	if id apu ; then
+		delgroup apu >/dev/null 2>&1
+		deluser apu >/dev/null 2>&1
 
 	fi
 	echo "Uninstalled Web Files"
