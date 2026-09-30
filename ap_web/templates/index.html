@@ -35,6 +35,11 @@
       <span></span> Connecting…
     </div>
 
+    <h2 class="section-title">Saved networks</h2>
+    <ul id="profiles" class="profiles">
+      <li class="profile-empty">Loading…</li>
+    </ul>
+
     <p class="footnote">The Wi-Fi profile is only kept if the connection succeeds.</p>
   </main>
 
@@ -45,10 +50,12 @@ const connectButton = document.getElementById('connect');
 const rescanButton = document.getElementById('rescan');
 const message = document.getElementById('message');
 const spinner = document.getElementById('spinner');
+const profilesList = document.getElementById('profiles');
 
 function showMessage(text, kind='error') {
   message.textContent = text;
   message.className = `message ${kind}`;
+  message.scrollIntoView({behavior: 'smooth', block: 'nearest'});
 }
 function clearMessage() {
   message.textContent = '';
@@ -59,6 +66,7 @@ function setBusy(busy) {
   rescanButton.disabled = busy;
   network.disabled = busy;
   password.disabled = busy;
+  profilesList.querySelectorAll('button, input').forEach(el => { el.disabled = busy; });
   spinner.classList.toggle('hidden', !busy);
 }
 function updatePasswordVisibility() {
@@ -102,6 +110,143 @@ async function loadNetworks(force=false) {
 network.addEventListener('change', updatePasswordVisibility);
 rescanButton.addEventListener('click', () => loadNetworks(true));
 
+function makeButton(text, className, onClick) {
+  const button = document.createElement('button');
+  button.type = 'button';
+  button.className = className;
+  button.textContent = text;
+  button.addEventListener('click', onClick);
+  return button;
+}
+
+async function loadProfiles() {
+  try {
+    const response = await fetch('/api/profiles');
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || 'Unable to load saved networks.');
+    renderProfiles(data.profiles);
+  } catch (error) {
+    profilesList.innerHTML = '<li class="profile-empty">Unable to load saved networks</li>';
+  }
+}
+
+function renderProfiles(profiles) {
+  profilesList.innerHTML = '';
+  if (!profiles.length) {
+    profilesList.innerHTML = '<li class="profile-empty">No saved networks</li>';
+    return;
+  }
+
+  for (const profile of profiles) {
+    const item = document.createElement('li');
+    item.className = 'profile';
+
+    const head = document.createElement('div');
+    head.className = 'profile-head';
+    const name = document.createElement('span');
+    name.className = 'profile-name';
+    name.textContent = profile.name;
+    const meta = document.createElement('span');
+    meta.className = 'profile-meta';
+    meta.textContent = `Priority ${profile.priority}`;
+    head.append(name, meta);
+
+    const form = document.createElement('form');
+    form.className = 'profile-edit hidden';
+    const pwInput = document.createElement('input');
+    pwInput.type = 'password';
+    pwInput.autocomplete = 'new-password';
+    pwInput.placeholder = 'New password (leave blank to keep)';
+    const prInput = document.createElement('input');
+    prInput.type = 'number';
+    prInput.min = '-999';
+    prInput.max = '999';
+    prInput.step = '1';
+    prInput.value = profile.priority;
+    prInput.setAttribute('aria-label', 'Priority');
+    const formActions = document.createElement('div');
+    formActions.className = 'profile-actions';
+    const saveButton = makeButton('Save', 'primary', () => {});
+    saveButton.type = 'submit';
+    formActions.append(saveButton, makeButton('Cancel', 'secondary', () => form.classList.add('hidden')));
+    const pwLabel = document.createElement('label');
+    pwLabel.textContent = 'Password';
+    const prLabel = document.createElement('label');
+    prLabel.textContent = 'Priority (higher connects first)';
+    form.append(pwLabel, pwInput, prLabel, prInput, formActions);
+    form.addEventListener('submit', (event) => {
+      event.preventDefault();
+      saveProfile(profile, pwInput.value, prInput.value);
+    });
+
+    const actions = document.createElement('div');
+    actions.className = 'profile-actions';
+    actions.append(
+      makeButton('Connect', 'primary', () => connectProfile(profile)),
+      makeButton('Edit', 'secondary', () => form.classList.toggle('hidden')),
+      makeButton('Delete', 'danger', () => deleteProfile(profile)),
+    );
+
+    item.append(head, actions, form);
+    profilesList.appendChild(item);
+  }
+}
+
+async function saveProfile(profile, newPassword, priority) {
+  clearMessage();
+  try {
+    const response = await fetch(`/api/profiles/${encodeURIComponent(profile.uuid)}`, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({password: newPassword, priority: Number(priority)})
+    });
+    const data = await response.json();
+    if (!data.success) throw new Error(data.error || 'Unable to save changes.');
+    showMessage(`Saved ${profile.name}`, 'success');
+    await loadProfiles();
+  } catch (error) {
+    showMessage(error.message);
+  }
+}
+
+async function deleteProfile(profile) {
+  if (!confirm(`Delete saved network "${profile.name}"?`)) return;
+  clearMessage();
+  try {
+    const response = await fetch(`/api/profiles/${encodeURIComponent(profile.uuid)}`, {method: 'DELETE'});
+    const data = await response.json();
+    if (!data.success) throw new Error(data.error || 'Unable to delete network.');
+    showMessage(`Deleted ${profile.name}`, 'success');
+    await loadProfiles();
+  } catch (error) {
+    showMessage(error.message);
+  }
+}
+
+async function connectProfile(profile) {
+  clearMessage();
+  setBusy(true);
+  try {
+    const response = await fetch(`/api/profiles/${encodeURIComponent(profile.uuid)}/connect`, {method: 'POST'});
+    await handleConnectResponse(response);
+  } catch (error) {
+    showMessage('The connection attempt could not be completed. The access point should still be available.');
+    setBusy(false);
+  }
+}
+
+async function handleConnectResponse(response) {
+  const data = await response.json();
+  if (data.success) {
+    showMessage(`Connected to ${data.ssid}`, 'success');
+    setTimeout(() => { window.location.href = 'http://' + data.ip + '/'; }, 5000);
+  } else {
+    showMessage(data.error || 'Connection failed. Please check the password and try again.');
+    setBusy(false);
+    await Promise.all([loadNetworks(false), loadProfiles()]);
+  }
+}
+
 connectButton.addEventListener('click', async () => {
   const ssid = network.value;
   if (!ssid) {
@@ -117,16 +262,7 @@ connectButton.addEventListener('click', async () => {
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({ssid, password: password.value})
     });
-    const data = await response.json();
-
-    if (data.success) {
-      showMessage(`Connected to ${data.ssid}`, 'success');
-      setTimeout(() => { window.location.href = 'http://' + data.ip + '/'; }, 5000);
-    } else {
-      showMessage(data.error || 'Connection failed. Please check the password and try again.');
-      setBusy(false);
-      await loadNetworks(false);
-    }
+    await handleConnectResponse(response);
   } catch (error) {
     showMessage('The connection attempt could not be completed. The access point should still be available.');
     setBusy(false);
@@ -134,6 +270,7 @@ connectButton.addEventListener('click', async () => {
 });
 
 loadNetworks();
+loadProfiles();
 </script>
 </body>
 </html>

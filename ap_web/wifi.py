@@ -17,6 +17,8 @@ class WiFiManager:
     and the configured AP profile is reactivated.
     """
 
+    CANDIDATE_NAME = "HammerTime WiFi Candidate"
+
     def __init__(self, interface: str, ap_connection: str, connect_timeout: int = 25):
         self.interface = interface
         self.ap_connection = ap_connection
@@ -58,6 +60,84 @@ class WiFiManager:
         if escaped:
             out.append("\\")
         return "".join(out)
+
+    @staticmethod
+    def _split_terse(line: str) -> List[str]:
+        # Split on unescaped ':' and decode each field.
+        fields, current, escaped = [], [], False
+        for char in line:
+            if escaped:
+                current.append(char)
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == ":":
+                fields.append("".join(current))
+                current = []
+            else:
+                current.append(char)
+        fields.append("".join(current))
+        return fields
+
+    def list_profiles(self) -> List[Dict]:
+        result = self._run("-t", "-f", "UUID,NAME,TYPE,AUTOCONNECT-PRIORITY", "connection", "show")
+        profiles = []
+        for line in result.stdout.splitlines():
+            parts = self._split_terse(line)
+            if len(parts) != 4:
+                continue
+            uuid, name, conn_type, priority = parts
+            if conn_type != "802-11-wireless" or name in (self.ap_connection, self.CANDIDATE_NAME):
+                continue
+            try:
+                priority_value = int(priority)
+            except ValueError:
+                priority_value = 0
+            profiles.append({"uuid": uuid, "name": name, "priority": priority_value})
+        return sorted(profiles, key=lambda p: (-p["priority"], p["name"].lower()))
+
+    def _get_profile(self, uuid: str) -> Dict:
+        for profile in self.list_profiles():
+            if profile["uuid"] == uuid:
+                return profile
+        raise WiFiError("Saved network not found.")
+
+    def connect_profile(self, uuid: str) -> Dict:
+        profile = self._get_profile(uuid)
+        self._deactivate_ap()
+        try:
+            self._run(
+                "connection", "up", "uuid", uuid,
+                "ifname", self.interface,
+                timeout=self.connect_timeout,
+            )
+            ip = self._wait_for_ip()
+            if not ip:
+                raise WiFiError("The network was found, but the Pi did not receive an IP address.")
+            return {
+                "success": True,
+                "ssid": profile["name"],
+                "ip": ip,
+                "message": "Wi-Fi connected successfully. The access point can now close.",
+            }
+        except Exception as exc:
+            # Keep the saved profile; only restore the AP.
+            self._run("connection", "down", "uuid", uuid, check=False)
+            self._reactivate_ap()
+            if isinstance(exc, WiFiError):
+                raise
+            raise WiFiError(str(exc)) from exc
+
+    def update_profile(self, uuid: str, password: Optional[str], priority: int):
+        self._get_profile(uuid)
+        args = ["connection", "modify", "uuid", uuid, "connection.autoconnect-priority", str(priority)]
+        if password:
+            args += ["wifi-sec.key-mgmt", "wpa-psk", "wifi-sec.psk", password]
+        self._run(*args)
+
+    def delete_profile(self, uuid: str):
+        self._get_profile(uuid)
+        self._run("connection", "delete", "uuid", uuid)
 
     def scan(self, force: bool = False) -> List[Dict]:
         args = [
@@ -209,7 +289,7 @@ class WiFiManager:
 
     def connect_and_commit(self, ssid: str, password: str) -> Dict:
         # Restrict the generated profile name to a stable, harmless identifier.
-        candidate = "HammerTime WiFi Candidate"
+        candidate = self.CANDIDATE_NAME
         saved_name = ssid
 
         self._deactivate_ap()
