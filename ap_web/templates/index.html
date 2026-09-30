@@ -25,7 +25,7 @@
 
     <div id="security-row">
       <label for="password">Password</label>
-      <input id="password" type="password" autocomplete="current-password" placeholder="Enter Wi-Fi password">
+      <input id="password" type="password" autocomplete="current-password" placeholder="Enter Wi-Fi password" required>
     </div>
 
     <button id="connect" class="primary">Connect</button>
@@ -71,14 +71,11 @@ function setBusy(busy) {
 }
 function updatePasswordVisibility() {
   const selected = network.options[network.selectedIndex];
-  const open = selected && selected.dataset.security === 'Open';
   document.getElementById('security-row').style.display = selected && selected.value ? 'block' : 'none';
-  password.placeholder = open ? 'No password required' : 'Enter Wi-Fi password';
-  if (open) password.value = '';
+  password.placeholder = 'Enter Wi-Fi password';
 }
 
 async function loadNetworks(force=false) {
-  clearMessage();
   network.innerHTML = '<option value="">Scanning...</option>';
   try {
     const response = await fetch(force ? '/api/rescan' : '/api/networks', {method: force ? 'POST' : 'GET'});
@@ -108,7 +105,7 @@ async function loadNetworks(force=false) {
 }
 
 network.addEventListener('change', updatePasswordVisibility);
-rescanButton.addEventListener('click', () => loadNetworks(true));
+rescanButton.addEventListener('click', () => { clearMessage(); loadNetworks(true); });
 
 function makeButton(text, className, onClick) {
   const button = document.createElement('button');
@@ -253,6 +250,11 @@ connectButton.addEventListener('click', async () => {
   const ssid = network.value;
   if (!ssid) {
     showMessage('Please select a Wi-Fi network.');
+    return;
+  }
+  if (!password.value.trim()) {
+    showMessage('Please enter a Wi-Fi password.');
+    password.focus();
     return;
   }
 

@@ -64,6 +64,9 @@ def connect():
     if not ssid:
         _connect_lock.release()
         return jsonify({"success": False, "error": "Please select a Wi-Fi network."}), 400
+    if not password.strip():
+        _connect_lock.release()
+        return jsonify({"success": False, "error": "Please enter a Wi-Fi password."}), 400
 
     try:
         _set_connecting(True)
