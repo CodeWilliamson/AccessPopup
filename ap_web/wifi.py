@@ -117,7 +117,8 @@ class WiFiManager:
                 state = value
             elif key == "GENERAL.CONNECTION":
                 connection = value
-            elif key == "IP4.ADDRESS":
+            # nmcli reports addresses as IP4.ADDRESS[1], IP4.ADDRESS[2], ...
+            elif key.startswith("IP4.ADDRESS") and value and not ip:
                 ip = value
 
         return {"state": state, "connection": connection, "ip": ip}
@@ -152,6 +153,16 @@ class WiFiManager:
 
     def _delete_connection(self, name: str):
         self._run("connection", "delete", name, check=False)
+
+    def _delete_profiles_named(self, name: str):
+        # Delete by UUID so every same-named profile is removed, not just the first match.
+        result = self._run("-t", "-f", "UUID,NAME", "connection", "show", check=False)
+        for line in result.stdout.splitlines():
+            if ":" not in line:
+                continue
+            uuid, raw_name = line.split(":", 1)
+            if self._decode_nmcli(raw_name) == name:
+                self._run("connection", "delete", "uuid", uuid, check=False)
 
     def _activate(self, name: str):
         return self._run(
@@ -188,7 +199,8 @@ class WiFiManager:
                 value = self._decode_nmcli(value)
                 if key == "GENERAL.STATE":
                     state = value
-                elif key == "IP4.ADDRESS" and value:
+                # nmcli reports addresses as IP4.ADDRESS[1], IP4.ADDRESS[2], ...
+                elif key.startswith("IP4.ADDRESS") and value and not ip:
                     ip = value
             if ip and ("connected" in state.lower() or state.startswith("100")):
                 return ip.split("/")[0]
@@ -211,6 +223,8 @@ class WiFiManager:
             # Rename the successful profile to the SSID and enable normal autoconnect.
             # The profile is already retained by NetworkManager; we now make it the
             # normal persistent connection.
+            if saved_name not in (candidate, self.ap_connection):
+                self._delete_profiles_named(saved_name)
             self._run("connection", "modify", candidate, "connection.id", saved_name)
             self._run("connection", "modify", saved_name, "connection.autoconnect", "yes")
 
