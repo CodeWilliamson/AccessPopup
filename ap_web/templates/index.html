@@ -120,8 +120,8 @@ connectButton.addEventListener('click', async () => {
     const data = await response.json();
 
     if (data.success) {
-      showMessage(`Connected to ${data.ssid}. HammerTime is switching to the rink Wi-Fi.`, 'success');
-      setTimeout(() => { window.location.href = 'http://' + data.ip + '/'; }, 2500);
+      showMessage(`Connected to ${data.ssid}`, 'success');
+      setTimeout(() => { window.location.href = 'http://' + data.ip + '/'; }, 5000);
     } else {
       showMessage(data.error || 'Connection failed. Please check the password and try again.');
       setBusy(false);
