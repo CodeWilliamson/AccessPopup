@@ -329,7 +329,7 @@ check_pizerow
 }
 
 #Main
-echo "RaspberryConnect.com - AccessPopup: Automated Access Point."
+echo "Running AccessPopup"
 isnm="$(systemctl is-active NetworkManager.service)"
 stat=$?
 if [ $stat -ne 0 ] ; then #NM not running

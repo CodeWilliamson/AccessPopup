@@ -233,7 +233,7 @@ deploy_web()
 
 web_setup()
 {
-	local pm="$(packageman)" src i rc=0
+	local pm="$(packageman)" src="" cur i rc=0
 	local depend=("python3-venv" "python3-pip")
 	rel_tmp=""
 
@@ -255,9 +255,16 @@ web_setup()
 		done
 	fi
 
-	if release_info && release_download; then
-		src="$rel_tmp/src/ap_web"
-	else
+	if release_info; then
+		cur="$(cat "${cpath}.release" 2>/dev/null)"
+		if [ "$cur" = "$rel_tag" ] && [ -f "${cpath}ap_web/app.py" ]; then
+			echo "The local web app files are already the latest release ($rel_tag)"
+			src="${cpath}ap_web"
+		elif release_download; then
+			src="$rel_tmp/src/ap_web"
+		fi
+	fi
+	if [ -z "$src" ]; then
 		echo "Using the local web app files in ${cpath}ap_web"
 		src="${cpath}ap_web"
 	fi
@@ -1354,9 +1361,9 @@ menu_more()
 	echo -e "Additional Options"$DEF
 	echo ""
 	echo " 1 = Web Interface - enable & disable switch"
-	echo " 2 = Change the Webport. default 8052"
+	echo " 2 = Change the Webport (default 8080)"
 	echo " 3 = When Wifi is Disabled: Automatically re-activate Y/N"
-	echo " 4 = Uninstall $scriptname and Web app"
+	echo " 4 = Uninstall $scriptname"
 	echo " 5 = Configure the Web app (product name and logo)"
 	echo " 6 = Back to the Main menu"
 	echo -e -n "\nSelect an Option:"
