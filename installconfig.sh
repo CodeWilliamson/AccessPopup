@@ -1073,6 +1073,9 @@ update_release()
 		read -p "Press any key to continue"
 		return 1
 	fi
+
+	# make the installer executable
+	chmod +x "${cpath}installconfig.sh"
 	printf '%s\n' "$rel_tag" > "${cpath}.release"
 	echo -e $YEL"Updated to release $rel_tag"$DEF
 	read -p "Press any key to restart the installer"
