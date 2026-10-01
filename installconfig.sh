@@ -1282,7 +1282,7 @@ menu()
 {
 #selection menu
 clear
-until [ "$select" = "9" ]; do #set number to qty of menu options
+until [ "$select" = "10" ]; do #set number to qty of menu options
 	active_wifi
 	apver="$( grep -F '#version' ${scriptname} )"
 	curip=$(nmcli -t con show "$active" | grep IP4.ADDRESS)
@@ -1307,33 +1307,35 @@ until [ "$select" = "9" ]; do #set number to qty of menu options
 		echo "System Hostname is: $hn"
 	fi
 	echo ""
-	echo " 1 = Install AccessPopup and the Web app"
-	echo " 2 = Change the AccessPopups SSID or Password"
-	echo " 3 = Change the AccessPopups IP Address"
-	echo " 4 = Live Switch between: Known WIFI Network <> Access Point"
-	echo " 5 = Setup a New WiFi Network or change the password to an existing Wifi Network"
-	echo " 6 = Change Hostname"
-	echo " 7 = Run $scriptname now. It will decide between a suitable WiFi network or AP."
-	echo " 8 = Additional Menu"
-	echo " 9 = Exit"
+	echo " 1 = Install AccessPopup"
+	echo " 2 = Update AccessPopup"
+	echo " 3 = Change the AccessPopups SSID or Password"
+	echo " 4 = Change the AccessPopups IP Address"
+	echo " 5 = Live Switch between: Known WIFI Network <> Access Point"
+	echo " 6 = Setup a New WiFi Network or change the password to an existing Wifi Network"
+	echo " 7 = Change Hostname"
+	echo " 8 = Run $scriptname now. It will decide between a suitable WiFi network or AP."
+	echo " 9 = Additional Menu"
+	echo " 10 = Exit"
 	echo ""
 	echo "The Wifi status will be checked every 2 minutes. Switching will happen when a"
 	echo "valid wifi network comes in and out of range."
-	echo "use option 4 or the command: sudo $scriptname -a"
+	echo "use option 5 or the command: sudo $scriptname -a"
 	echo "to activate a permanent access point, until the next reboot"
 	echo "or when just sudo $scriptname is used."
 	echo -e -n "\nSelect an Option:"
 	read select
 	case $select in
 	1) clear ; go "INS" ;; #Install AccessPopup
-	2) clear ; go "SSI" ;; #Set the AP SSID and Password
-	3) clear ; go "IPA" ;; #Set the Access Points IP Address
-	4) clear ; go "SWI" ;; #Live Switch: NW <> AP
-	5) clear ; go "NWK" ;; #Connect to New WiFi Network
-	6) clear ; go "HST" ;; #Change Hostname
-	7) clear ; go "RUN" ;; #Run the AccessPopup script now
-	8) clear ; go "MU2" ;; #Additional Menu
-	9) clear ; exit ;;
+	2) clear ; go "UPD" ;; #Update to latest release
+	3) clear ; go "SSI" ;; #Set the AP SSID and Password
+	4) clear ; go "IPA" ;; #Set the Access Points IP Address
+	5) clear ; go "SWI" ;; #Live Switch: NW <> AP
+	6) clear ; go "NWK" ;; #Connect to New WiFi Network
+	7) clear ; go "HST" ;; #Change Hostname
+	8) clear ; go "RUN" ;; #Run the AccessPopup script now
+	9) clear ; go "MU2" ;; #Additional Menu
+	10) clear ; exit ;;
 	*) clear; echo -e "Please select again\n";;
 	esac
 done
@@ -1343,7 +1345,7 @@ menu_more()
 {
 	#Additional menu
 	clear
-	until [ "$select" = "7" ]; do #set number to qty of menu options
+	until [ "$select" = "6" ]; do #set number to qty of menu options
 	echo -e $YEL"Raspberryconnect.com"
 	echo "AccessPopup installation and setup"
 	echo -e "Additional Options"$DEF
@@ -1352,9 +1354,8 @@ menu_more()
 	echo " 2 = Change the Webport. default 8052"
 	echo " 3 = When Wifi is Disabled: Automatically re-activate Y/N"
 	echo " 4 = Uninstall $scriptname and Web app"
-	echo " 5 = Update to the latest release (project and Web app)"
-	echo " 6 = Configure the Web app (product name and logo)"
-	echo " 7 = Back to the Main menu"
+	echo " 5 = Configure the Web app (product name and logo)"
+	echo " 6 = Back to the Main menu"
 	echo -e -n "\nSelect an Option:"
 	read select
 	case $select in
@@ -1362,9 +1363,8 @@ menu_more()
 	2) clear ; go "WPO" ;; #Web Port number
 	3) clear ; go "DIS" ;; #Wifi reactivation options
 	4) clear ; go "UNI" ;; #Uninstall AccessPopup
-	5) clear ; go "UPD" ;; #Update to latest release
-	6) clear ; go "CFG" ;; #Configure web app branding
-	7) clear ; menu ;;
+	5) clear ; go "CFG" ;; #Configure web app branding
+	6) clear ; menu ;;
 	*) Clear ; echo -e "Please select again\n";;
 	esac
 done
