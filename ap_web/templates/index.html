@@ -9,10 +9,10 @@
 <body>
   <main class="card">
     <header>
-      <img src="{{ url_for('static', filename='pi-logo.svg') }}" alt="Raspberry Pi Logo" width="64" height="64">
+      <img src="{{ url_for('static', filename=logo_filename) }}" alt="Raspberry Pi Logo" width="64">
       <div>
         <h1>Wi-Fi Setup</h1>
-        <p>Connect Raspberry Pi to Wi-Fi</p>
+        <p>Connect {{ product_name }} to Wi-Fi</p>
       </div>
     </header>
 

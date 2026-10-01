@@ -1009,6 +1009,186 @@ webport()
 	fi
 }
 
+update_release()
+{
+	local api="https://api.github.com/repos/CodeWilliamson/AccessPopup/releases/latest"
+	local tarball_prefix="https://api.github.com/repos/CodeWilliamson/AccessPopup/tarball/"
+	local json tag url cur ans tmp f
+	local was_active=0
+	local rc=0
+
+	for f in curl tar python3; do
+		if ! command -v "$f" >/dev/null 2>&1; then
+			echo "$f is required for the update but is not installed."
+			read -p "Press any key to continue"
+			return 1
+		fi
+	done
+
+	echo "Checking for the latest release..."
+	json="$(curl -fsSL --max-time 30 -H 'Accept: application/vnd.github+json' "$api")"
+	if [ $? -ne 0 ]; then
+		echo "Unable to get the latest release from GitHub."
+		echo "Check the internet connection and that a release has been published."
+		read -p "Press any key to continue"
+		return 1
+	fi
+	tag="$(printf '%s' "$json" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("tag_name",""))' 2>/dev/null)"
+	url="$(printf '%s' "$json" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("tarball_url",""))' 2>/dev/null)"
+	if [[ ! "$tag" =~ ^[A-Za-z0-9._-]+$ ]] || [[ "$url" != "$tarball_prefix"* ]]; then
+		echo "The GitHub response did not contain a valid release."
+		read -p "Press any key to continue"
+		return 1
+	fi
+
+	cur="$(cat "${cpath}.release" 2>/dev/null)"
+	echo "Installed release: ${cur:-unknown}"
+	echo "Latest release:    $tag"
+	if [ "$cur" = "$tag" ]; then
+		echo "Already up to date."
+		read -p "Press any key to continue"
+		return 0
+	fi
+	read -p "Update to $tag now? [y/N] " ans
+	if [[ ! "$ans" =~ ^[Yy]$ ]]; then
+		return 0
+	fi
+
+	tmp="$(mktemp -d)" || { echo "Unable to create a temporary directory"; read -p "Press any key to continue"; return 1; }
+	mkdir "$tmp/src"
+	echo "Downloading $tag..."
+	if ! curl -fsSL --max-time 120 -o "$tmp/release.tar.gz" "$url" || ! tar -xzf "$tmp/release.tar.gz" -C "$tmp/src" --strip-components=1; then
+		echo "The download failed. Nothing has been changed."
+		rm -rf "$tmp"
+		read -p "Press any key to continue"
+		return 1
+	fi
+	for f in installconfig.sh accesspopup ap_web/app.py ap_web/requirements.txt; do
+		if [ ! -f "$tmp/src/$f" ]; then
+			echo "The release is missing $f. Nothing has been changed."
+			rm -rf "$tmp"
+			read -p "Press any key to continue"
+			return 1
+		fi
+	done
+
+	echo "Updating project files in $cpath"
+	#Write to a temp name then mv, so the running installer keeps reading its original file
+	while IFS= read -r -d '' f; do
+		mkdir -p "$(dirname "${cpath}${f}")" && cp -p "$tmp/src/$f" "${cpath}${f}.new" && mv -f "${cpath}${f}.new" "${cpath}${f}" || { rc=1; break; }
+	done < <(cd "$tmp/src" && find . -type f -print0)
+
+	if [ $rc -eq 0 ] && [ -d "$web_path" ]; then
+		echo "Updating the web app in $web_path"
+		if systemctl is-active --quiet "$webapp"; then
+			was_active=1
+		fi
+		#Overlay copy keeps the existing venv and uploaded logo files
+		cp -rf "$tmp/src/ap_web/." "$web_path" \
+		&& { [ -x "$web_path/venv/bin/pip" ] || python3 -m venv "$web_path/venv"; } \
+		&& "$web_path/venv/bin/pip" install -r "$web_path/requirements.txt" \
+		&& chmod 755 "$web_path/app.py" || rc=1
+		if [ $was_active -eq 1 ]; then
+			echo "Restarting the web app service"
+			systemctl restart "$webapp"
+		fi
+	elif [ $rc -eq 0 ]; then
+		echo "The web app is not installed, only the project files were updated."
+	fi
+	rm -rf "$tmp"
+
+	if [ $rc -ne 0 ]; then
+		echo "The update failed part way through. Please check the files and try again."
+		read -p "Press any key to continue"
+		return 1
+	fi
+	printf '%s\n' "$tag" > "${cpath}.release"
+	echo -e $YEL"Updated to release $tag"$DEF
+	read -p "Press any key to restart the installer"
+	exec bash "${cpath}installconfig.sh"
+}
+
+config_web()
+{
+	local name logo ext base size dest tmp
+	local logo_name=""
+	local bad_re='["\\%]'
+
+	if [ ! -f "${sysd_path}${webapp}" ] || [ ! -d "$web_path" ]; then
+		echo "The Web Interface is not installed. Install it first from this menu (option 1)."
+		read -p "Press any key to continue"
+		return 1
+	fi
+	echo -e $YEL$BOL"Configure the Web App"$DEF
+	echo "Enter the product name shown in the web app"
+	echo "or just press enter to use the default"
+	read -r name
+	if [[ "$name" =~ $bad_re ]] || [[ "$name" =~ [[:cntrl:]] ]] || [ ${#name} -gt 64 ]; then
+		echo "The product name must be 64 characters or less and cannot contain \" \\ or %"
+		read -p "Press any key to continue"
+		return 1
+	fi
+
+	echo "Enter the full path to the logo file (png, jpg, jpeg, gif, svg or webp, max 2MB)"
+	echo "or just press enter to use the default"
+	read -r logo
+	if [ -n "$logo" ]; then
+		ext="${logo##*.}"
+		ext="${ext,,}"
+		if [ ! -f "$logo" ] || [ ! -r "$logo" ]; then
+			echo "The logo file $logo was not found or is not readable."
+			read -p "Press any key to continue"
+			return 1
+		fi
+		case "$ext" in
+			png|jpg|jpeg|gif|svg|webp) ;;
+			*) echo "The logo must be a png, jpg, jpeg, gif, svg or webp file."
+			   read -p "Press any key to continue"
+			   return 1 ;;
+		esac
+		size="$(stat -c %s "$logo")"
+		if [ "$size" -gt 2097152 ]; then
+			echo "The logo file is larger than 2MB."
+			read -p "Press any key to continue"
+			return 1
+		fi
+		base="$(basename "$logo")"
+		base="${base//[^A-Za-z0-9._-]/_}"
+		base="${base#.}"
+		dest="$web_path/static/$base"
+		mkdir -p "$web_path/static"
+		if [ "$(readlink -f "$logo")" != "$(readlink -f "$dest")" ]; then
+			if ! install -m 644 "$logo" "$dest"; then
+				echo "Unable to copy the logo to $web_path/static"
+				read -p "Press any key to continue"
+				return 1
+			fi
+		fi
+		logo_name="$base"
+	fi
+
+	#Replace any previous branding lines, then add the new ones before ExecStart
+	tmp="$(mktemp)" || return 1
+	awk -v n="$name" -v l="$logo_name" '
+		/^Environment="?FLASK_(PRODUCT_NAME|LOGO_FILENAME)=/ { next }
+		/^ExecStart=/ {
+			if (n != "") print "Environment=\"FLASK_PRODUCT_NAME=" n "\""
+			if (l != "") print "Environment=\"FLASK_LOGO_FILENAME=" l "\""
+		}
+		{ print }
+	' "${sysd_path}${webapp}" > "$tmp" && cat "$tmp" > "${sysd_path}${webapp}"
+	rm -f "$tmp"
+	systemctl daemon-reload
+	if systemctl is-active --quiet "$webapp"; then
+		systemctl restart "$webapp"
+	fi
+
+	echo ""
+	echo "Product name: ${name:-default}"
+	echo "Logo file:    ${logo_name:-default}"
+	read -p "Press any key to continue"
+}
+
 uninstall()
 {
 	echo "Uninstalling $scriptname"
@@ -1118,6 +1298,10 @@ go()
 		menu_more
 	elif  [ "$opt" = "WPO" ] ;then
 		webport
+	elif [ "$opt" = "UPD" ] ;then
+		update_release
+	elif [ "$opt" = "CFG" ] ;then
+		config_web
 	fi
 	clear
 	menu
@@ -1188,7 +1372,7 @@ menu_more()
 {
 	#Additional menu
 	clear
-	until [ "$select" = "5" ]; do #set number to qty of menu options
+	until [ "$select" = "7" ]; do #set number to qty of menu options
 	echo -e $YEL"Raspberryconnect.com"
 	echo "AccessPopup installation and setup"
 	echo -e "Additional Options"$DEF
@@ -1197,7 +1381,9 @@ menu_more()
 	echo " 2 = Change the Webport. default 8052"
 	echo " 3 = When Wifi is Disabled: Automatically re-activate Y/N"
 	echo " 4 = Uninstall $scriptname and Web app"
-	echo " 5 = Back to the Main menu"
+	echo " 5 = Update to the latest release (project and Web app)"
+	echo " 6 = Configure the Web app (product name and logo)"
+	echo " 7 = Back to the Main menu"
 	echo -e -n "\nSelect an Option:"
 	read select
 	case $select in
@@ -1205,7 +1391,9 @@ menu_more()
 	2) clear ; go "WPO" ;; #Web Port number
 	3) clear ; go "DIS" ;; #Wifi reactivation options
 	4) clear ; go "UNI" ;; #Uninstall AccessPopup
-	5) clear ; menu ;;
+	5) clear ; go "UPD" ;; #Update to latest release
+	6) clear ; go "CFG" ;; #Configure web app branding
+	7) clear ; menu ;;
 	*) Clear ; echo -e "Please select again\n";;
 	esac
 done

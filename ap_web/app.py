@@ -9,6 +9,11 @@ from flask import Flask, jsonify, render_template, request
 from wifi import WiFiManager, WiFiError
 
 app = Flask(__name__)
+app.config["LOGO_FILENAME"] = "pi-logo.svg"
+app.config["PRODUCT_NAME"] = "Raspberry Pi"
+# Override via environment, e.g. FLASK_LOGO_FILENAME=my-logo.png
+# Override via environment, e.g. FLASK_PRODUCT_NAME="My Product"
+app.config.from_prefixed_env()
 
 WIFI_INTERFACE = os.getenv("WIFI_INTERFACE", "wlan0")
 AP_CONNECTION = os.getenv("AP_CONNECTION", "HammerTime AP")
@@ -31,7 +36,9 @@ def _set_connecting(value: bool):
 
 @app.get("/")
 def index():
-    return render_template("index.html", ap_name=AP_CONNECTION)
+    return render_template("index.html", 
+                           logo_filename=app.config["LOGO_FILENAME"], 
+                           product_name=app.config["PRODUCT_NAME"])
 
 
 @app.get("/api/networks")
@@ -163,7 +170,7 @@ def delete_profile(uuid):
 @app.errorhandler(404)
 def not_found(_):
     # Useful when accesspopup/captive-portal detection requests a platform-specific URL.
-    return render_template("index.html", ap_name=AP_CONNECTION), 200
+    return render_template("index.html", ap_name=AP_CONNECTION, logo_filename=app.config["LOGO_FILENAME"]), 200
 
 
 if __name__ == "__main__":
