@@ -167,101 +167,123 @@ else
 fi
 }
 
-chk_cmd() {
-	local cmds=("$@")
-    set -uo pipefail
+#Sets rel_tag and rel_url from the latest GitHub release
+release_info()
+{
+	local api="https://api.github.com/repos/CodeWilliamson/AccessPopup/releases/latest"
+	local tarball_prefix="https://api.github.com/repos/CodeWilliamson/AccessPopup/tarball/"
+	local json f
+	rel_tag=""; rel_url=""
 
-    for cmd_str in "${cmds[@]}"; do
-        if ! bash -c "$cmd_str" ; then
-			echo "There is an issue while installing the webfiles."
-			echo "Unable to complete the web setup. Removing any installed files."
-            uninstall_web
-            return 1
-        fi
-    done
+	for f in curl tar python3; do
+		command -v "$f" >/dev/null 2>&1 || { echo "$f is required to fetch a release but is not installed."; return 1; }
+	done
+	echo "Checking for the latest release..."
+	json="$(curl -fsSL --max-time 30 -H 'Accept: application/vnd.github+json' "$api")" || {
+		echo "Unable to get the latest release from GitHub."
+		echo "Check the internet connection and that a release has been published."
+		return 1
+	}
+	rel_tag="$(printf '%s' "$json" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("tag_name",""))' 2>/dev/null)"
+	rel_url="$(printf '%s' "$json" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("tarball_url",""))' 2>/dev/null)"
+	if [[ ! "$rel_tag" =~ ^[A-Za-z0-9._-]+$ ]] || [[ "$rel_url" != "$tarball_prefix"* ]]; then
+		echo "The GitHub response did not contain a valid release."
+		return 1
+	fi
+}
+
+#Extracts the release from release_info to $rel_tmp/src. The caller must rm -rf "$rel_tmp"
+release_download()
+{
+	local f bad=""
+	rel_tmp="$(mktemp -d)" || { rel_tmp=""; echo "Unable to create a temporary directory"; return 1; }
+	mkdir "$rel_tmp/src"
+	echo "Downloading $rel_tag..."
+	if ! curl -fsSL --max-time 120 -o "$rel_tmp/release.tar.gz" "$rel_url" || ! tar -xzf "$rel_tmp/release.tar.gz" -C "$rel_tmp/src" --strip-components=1; then
+		bad="The download failed."
+	else
+		for f in installconfig.sh accesspopup ap_web/app.py ap_web/requirements.txt; do
+			[ -f "$rel_tmp/src/$f" ] || bad="The release is missing $f."
+		done
+	fi
+	if [ -n "$bad" ]; then
+		echo "$bad"
+		rm -rf "$rel_tmp"; rel_tmp=""
+		return 1
+	fi
+}
+
+#Copies the web app files from $1 into $web_path and refreshes the venv
+deploy_web()
+{
+	local was_active=0 rc=0
+	systemctl is-active --quiet "$webapp" && was_active=1
+	#Overlay copy keeps the existing venv and uploaded logo files
+	mkdir -p "$web_path" && cp -rf "$1/." "$web_path" \
+	&& { [ -x "$web_path/venv/bin/pip" ] || python3 -m venv "$web_path/venv"; } \
+	&& "$web_path/venv/bin/pip" install -r "$web_path/requirements.txt" \
+	&& "$web_path/venv/bin/pip" check \
+	&& chmod 755 "$web_path/app.py" || rc=1
+	if [ $was_active -eq 1 ]; then
+		echo "Restarting the web app service"
+		systemctl restart "$webapp"
+	fi
+	return $rc
+}
+
+web_setup()
+{
+	local pm="$(packageman)" src i rc=0
+	local depend=("python3-venv" "python3-pip")
+	rel_tmp=""
+
+	if [ ! -f "$script_path$scriptname" ]; then
+		echo "The Accesspopup script is not installed. Please install AccessPopup (Option 1) and then try again."
+		return 1
+	fi
+	if ! command -v python3 >/dev/null 2>&1; then
+		echo "Python3 is required for the web page feature but it is unavailable"
+		return 1
+	fi
+	if [ "$pm" = 'apt' ]; then
+		for i in "${depend[@]}"; do
+			dpkg -s "$i" >/dev/null 2>&1 || apt install "$i" || {
+				echo "Unable to install dependency $i"
+				echo "This may be because there is no internet access or the package is unavailable"
+				return 1
+			}
+		done
+	fi
+
+	if release_info && release_download; then
+		src="$rel_tmp/src/ap_web"
+	else
+		echo "Using the local web app files in ${cpath}ap_web"
+		src="${cpath}ap_web"
+	fi
+	if [ -f "$src/app.py" ] && deploy_web "$src" && add_permissions; then
+		add_web_app_service
+		systemctl daemon-reload
+		systemctl enable --now "$webapp"
+	else
+		echo "Unable to complete the web setup. Removing any installed files."
+		uninstall_web
+		rc=1
+	fi
+	[ -n "$rel_tmp" ] && rm -rf "$rel_tmp"
+	return $rc
 }
 
 install_web()
 {
-	local pm="$(packageman)"
-	local depend=("python3-venv" "python3-pip")
-
-	if [ ! -f "$script_path$scriptname" ]; then
-		echo "The Accesspopup script is not installed. Please install AccessPopup (Option 1) and then try again."
-		read -p "Press any key to continue"
-		menu
+	if web_setup; then
+		config_web
+		echo ""
+		echo -e $YEL"The web app has been installed."
+		echo "In a web browser use http://localhost:8080 on this device or"
+		echo -e "from another device use the http://ip_address:8080 or the http://hostname:8080"
+		echo -e "From devices connected to the Access Point use http://192.168.50.1:8080" $DEF
 	fi
-	py="$(python3 --version)"
-	if [ $? -gt 0 ] ;then
-		echo "Python3 is required for the web page feature but it is unavailable"
-		echo "Unable to install the webpage feature"
-		read -p "Press any key to continue"
-		menu
-	else
-		if [ "$pm" = 'apt' ];then
-			for i in "${depend[@]}"; do
-				dpkg -s "$i" >/dev/null 2>&1
-				if [ $? -gt 0 ]; then
-					apt install "$i"
-					if [ $? -gt 0 ] ;then
-						echo "Unable to install dependency ${depend[@]}"
-						echo "The Webpage features cannot be installed."
-						echo "This may be because there is no internet access or the package is unavailable"
-						read -p "Press any key to continue"
-						menu
-					fi
-				fi
-			done
-		fi
-	fi
-
-
-	install_list=(
-		"mkdir \"$web_path\""
-		"cp -rf \"${cpath}ap_web/.\" \"$web_path\""
-		"python3 -m venv \"$web_path/venv\""
-		"\"$web_path/venv/bin/pip\" install -r \"$web_path/requirements.txt\" && \"$web_path/venv/bin/pip\" check"
-		"chmod 755 \"$web_path/app.py\""
-	)
-
-	if [ ! -d "$web_path" ] ; then #web_path doesn't exist
-		chk_cmd "${install_list[@]}"
-		if [ $? = 0 ];then
-			if add_permissions ;then
-				echo "Add services"
-				add_web_app_service #add web app service
-				systemctl daemon-reload
-				systemctl start $webapp
-			else
-				echo "Unable to set sudoers permissions"
-				echo "Unable to complete the setup of the Web files."
-				echo "The Web feature files will be removed"
-				read -p "Press any key to continue"
-				uninstall_web
-				menu
-			fi
-		else
-			menu
-		fi
-	else #web_path exists, check other files
-		echo "script Path is $cpath"
-		echo "Checking that the required files are in place"
-		if comm -23 <(cd ${cpath}ap_web/ && find . -type f | sort) <(cd $web_path && find . -type f | sort) | grep . ; then
-			echo "Some files from ${cpath}ap_web/ are missing in $web_path"
-			echo "re-installing files"
-
-			cp "${cpath}ap_get_std.py" "$web_path"
-			chmod +x "${web_path}/ap_get_std.py"
-			add_web_app_service #add web app service
-			systemctl daemon-reload
-			systemctl start $webapp
-		fi
-	fi
-	echo ""
-	echo -e $YEL"The web app has been installed."
-	echo "In a web browser use http://localhost:8080 on this device or"
-	echo -e "from another device use the http://ip_address:8080 or the http://hostname:8080"
-	echo -e "From devices connected to the Access Point use http://192.168.50.1:8080" $DEF
 	read -p "Press any key to continue"
 }
 
@@ -451,6 +473,8 @@ if [ -f "./$scriptname" ]; then
 	cp "./$scriptname" "$script_path"
 	cp "./$conf_file" "${conf_path}${conf_file}"
 	chmod +x "${script_path}${scriptname}"
+	#Install the web app before the network script runs, as it may take the device offline
+	install_web
 	add_service
 	add_timer_service
 	systemctl start $timer
@@ -1011,99 +1035,46 @@ webport()
 
 update_release()
 {
-	local api="https://api.github.com/repos/CodeWilliamson/AccessPopup/releases/latest"
-	local tarball_prefix="https://api.github.com/repos/CodeWilliamson/AccessPopup/tarball/"
-	local json tag url cur ans tmp f
-	local was_active=0
+	local cur ans f
 	local rc=0
 
-	for f in curl tar python3; do
-		if ! command -v "$f" >/dev/null 2>&1; then
-			echo "$f is required for the update but is not installed."
-			read -p "Press any key to continue"
-			return 1
-		fi
-	done
-
-	echo "Checking for the latest release..."
-	json="$(curl -fsSL --max-time 30 -H 'Accept: application/vnd.github+json' "$api")"
-	if [ $? -ne 0 ]; then
-		echo "Unable to get the latest release from GitHub."
-		echo "Check the internet connection and that a release has been published."
-		read -p "Press any key to continue"
-		return 1
-	fi
-	tag="$(printf '%s' "$json" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("tag_name",""))' 2>/dev/null)"
-	url="$(printf '%s' "$json" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("tarball_url",""))' 2>/dev/null)"
-	if [[ ! "$tag" =~ ^[A-Za-z0-9._-]+$ ]] || [[ "$url" != "$tarball_prefix"* ]]; then
-		echo "The GitHub response did not contain a valid release."
-		read -p "Press any key to continue"
-		return 1
-	fi
-
+	release_info || { read -p "Press any key to continue"; return 1; }
 	cur="$(cat "${cpath}.release" 2>/dev/null)"
 	echo "Installed release: ${cur:-unknown}"
-	echo "Latest release:    $tag"
-	if [ "$cur" = "$tag" ]; then
+	echo "Latest release:    $rel_tag"
+	if [ "$cur" = "$rel_tag" ]; then
 		echo "Already up to date."
 		read -p "Press any key to continue"
 		return 0
 	fi
-	read -p "Update to $tag now? [y/N] " ans
+	read -p "Update to $rel_tag now? [y/N] " ans
 	if [[ ! "$ans" =~ ^[Yy]$ ]]; then
 		return 0
 	fi
 
-	tmp="$(mktemp -d)" || { echo "Unable to create a temporary directory"; read -p "Press any key to continue"; return 1; }
-	mkdir "$tmp/src"
-	echo "Downloading $tag..."
-	if ! curl -fsSL --max-time 120 -o "$tmp/release.tar.gz" "$url" || ! tar -xzf "$tmp/release.tar.gz" -C "$tmp/src" --strip-components=1; then
-		echo "The download failed. Nothing has been changed."
-		rm -rf "$tmp"
-		read -p "Press any key to continue"
-		return 1
-	fi
-	for f in installconfig.sh accesspopup ap_web/app.py ap_web/requirements.txt; do
-		if [ ! -f "$tmp/src/$f" ]; then
-			echo "The release is missing $f. Nothing has been changed."
-			rm -rf "$tmp"
-			read -p "Press any key to continue"
-			return 1
-		fi
-	done
+	release_download || { echo "Nothing has been changed."; read -p "Press any key to continue"; return 1; }
 
 	echo "Updating project files in $cpath"
 	#Write to a temp name then mv, so the running installer keeps reading its original file
 	while IFS= read -r -d '' f; do
-		mkdir -p "$(dirname "${cpath}${f}")" && cp -p "$tmp/src/$f" "${cpath}${f}.new" && mv -f "${cpath}${f}.new" "${cpath}${f}" || { rc=1; break; }
-	done < <(cd "$tmp/src" && find . -type f -print0)
+		mkdir -p "$(dirname "${cpath}${f}")" && cp -p "$rel_tmp/src/$f" "${cpath}${f}.new" && mv -f "${cpath}${f}.new" "${cpath}${f}" || { rc=1; break; }
+	done < <(cd "$rel_tmp/src" && find . -type f -print0)
 
 	if [ $rc -eq 0 ] && [ -d "$web_path" ]; then
 		echo "Updating the web app in $web_path"
-		if systemctl is-active --quiet "$webapp"; then
-			was_active=1
-		fi
-		#Overlay copy keeps the existing venv and uploaded logo files
-		cp -rf "$tmp/src/ap_web/." "$web_path" \
-		&& { [ -x "$web_path/venv/bin/pip" ] || python3 -m venv "$web_path/venv"; } \
-		&& "$web_path/venv/bin/pip" install -r "$web_path/requirements.txt" \
-		&& chmod 755 "$web_path/app.py" || rc=1
-		if [ $was_active -eq 1 ]; then
-			echo "Restarting the web app service"
-			systemctl restart "$webapp"
-		fi
+		deploy_web "$rel_tmp/src/ap_web" || rc=1
 	elif [ $rc -eq 0 ]; then
 		echo "The web app is not installed, only the project files were updated."
 	fi
-	rm -rf "$tmp"
+	rm -rf "$rel_tmp"
 
 	if [ $rc -ne 0 ]; then
 		echo "The update failed part way through. Please check the files and try again."
 		read -p "Press any key to continue"
 		return 1
 	fi
-	printf '%s\n' "$tag" > "${cpath}.release"
-	echo -e $YEL"Updated to release $tag"$DEF
+	printf '%s\n' "$rel_tag" > "${cpath}.release"
+	echo -e $YEL"Updated to release $rel_tag"$DEF
 	read -p "Press any key to restart the installer"
 	exec bash "${cpath}installconfig.sh"
 }
@@ -1223,7 +1194,7 @@ uninstall_web()
 		rm -r $web_path
 	fi
 	#remove systemd services
-	if systemctl -all list-unit-files $webback | grep $webback ;then
+	if systemctl -all list-unit-files $webapp | grep $webapp ;then
 		systemctl stop $webapp
 		systemctl disable $webapp
 		systemctl daemon-reload
@@ -1336,7 +1307,7 @@ until [ "$select" = "9" ]; do #set number to qty of menu options
 		echo "System Hostname is: $hn"
 	fi
 	echo ""
-	echo " 1 = Install AccessPopup Script"
+	echo " 1 = Install AccessPopup and the Web app"
 	echo " 2 = Change the AccessPopups SSID or Password"
 	echo " 3 = Change the AccessPopups IP Address"
 	echo " 4 = Live Switch between: Known WIFI Network <> Access Point"
