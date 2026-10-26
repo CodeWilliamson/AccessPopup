@@ -27,6 +27,16 @@ timer=AccessPopup.timer
 webapp=ap_web_app.service
 sudoers_file="/etc/sudoers.d/apu"
 
+#nginx
+web_port="8080"
+nginx_conf="/etc/nginx/nginx.conf"
+nginx_avail="/etc/nginx/sites-available"
+nginx_enabled="/etc/nginx/sites-enabled"
+nginx_site="${nginx_avail}/accesspopup"
+nginx_site_link="${nginx_enabled}/accesspopup"
+nginx_include="/etc/nginx/conf.d/accesspopup-sites.conf"
+nginx_dispatch="/etc/NetworkManager/dispatcher.d/90-accesspopup-nginx"
+
 #Text Format
 YEL='\e[38;2;255;255;0m'
 GRE='\e[38;0;255;0;0m'
@@ -126,7 +136,7 @@ Environment=WIFI_INTERFACE=wlan0
 Environment=AP_CONNECTION=HammerTime AP
 Environment=WIFI_CONNECT_TIMEOUT=25
 Environment=PORTAL_HOST=0.0.0.0
-Environment=PORTAL_PORT=8080
+Environment=PORTAL_PORT=${web_port}
 ExecStart=/usr/local/bin/ap_web/venv/bin/python /usr/local/bin/ap_web/app.py
 Restart=on-failure
 RestartSec=5
@@ -138,6 +148,185 @@ NoNewPrivileges=false
 WantedBy=multi-user.target
 EOF
 fi
+}
+
+#Returns the Access Point IPv4 address from accesspopup.conf
+ap_ip_address()
+{
+	local ip=""
+	if [ -f "${conf_path}${conf_file}" ]; then
+		ip="$(grep -E '^[[:space:]]*ap_ip=' "${conf_path}${conf_file}" 2>/dev/null | head -n1 | cut -d= -f2-)"
+		ip="${ip//[[:space:]]/}"
+		ip="${ip//\'/}"
+		ip="${ip//\"/}"
+		ip="${ip%%#*}"
+		ip="${ip%%/*}"
+	fi
+	if [[ ! "$ip" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then
+		ip="192.168.50.1"
+	fi
+	printf '%s\n' "$ip"
+}
+
+install_nginx()
+{
+	if command -v nginx >/dev/null 2>&1; then
+		return 0
+	fi
+	local pm="$(packageman)"
+	case "$pm" in
+		apt)
+			apt install nginx
+			;;
+		dnf)
+			dnf install nginx
+			;;
+		pacman)
+			pacman -S nginx
+			;;
+		*)
+			echo "Unable to determine the package manager. nginx must be installed manually."
+			return 1
+			;;
+	esac
+}
+
+#Makes sure nginx includes /etc/nginx/sites-enabled on distributions that do not do so by default
+ensure_nginx_sites_include()
+{
+	local f found=0
+	for f in "$nginx_conf" /etc/nginx/conf.d/*.conf; do
+		[ "$f" = "$nginx_include" ] && continue
+		[ -f "$f" ] || continue
+		if grep -Eq '^[[:space:]]*include[[:space:]]+.*sites-enabled' "$f"; then
+			found=1
+			break
+		fi
+	done
+	if [ "$found" -eq 1 ]; then
+		#Another nginx file already includes sites-enabled, so avoid a duplicate include
+		rm -f "$nginx_include"
+		return 0
+	fi
+	mkdir -p "$(dirname "$nginx_include")" || return 1
+	printf '%s\n' 'include /etc/nginx/sites-enabled/*;' > "$nginx_include" || return 1
+	return 0
+}
+
+add_nginx_site()
+{
+	local ip backup=""
+	ip="$(ap_ip_address)"
+	mkdir -p "$nginx_avail" "$nginx_enabled" || return 1
+	if [ -f "$nginx_site" ]; then
+		backup="$(mktemp)" || return 1
+		cp -p "$nginx_site" "$backup" || { rm -f "$backup"; return 1; }
+	fi
+	cat > "$nginx_site" <<EOF
+server {
+	listen ${ip}:80;
+	server_name _;
+
+	location / {
+		proxy_pass http://127.0.0.1:${web_port};
+		proxy_http_version 1.1;
+		proxy_set_header Host \$host;
+		proxy_set_header X-Real-IP \$remote_addr;
+		proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+		proxy_set_header X-Forwarded-Proto \$scheme;
+	}
+}
+EOF
+	if ! ln -sfn "$nginx_site" "$nginx_site_link" || ! ensure_nginx_sites_include; then
+		echo "Unable to enable the nginx site for AccessPopup."
+		if [ -n "$backup" ]; then
+			cp -p "$backup" "$nginx_site"
+		else
+			rm -f "$nginx_site_link" "$nginx_site"
+		fi
+		rm -f "$backup"
+		return 1
+	fi
+	if ! nginx -t >/dev/null 2>&1; then
+		echo "The nginx configuration test failed."
+		nginx -t
+		if [ -n "$backup" ]; then
+			cp -p "$backup" "$nginx_site"
+		else
+			rm -f "$nginx_site_link" "$nginx_site"
+		fi
+		rm -f "$backup"
+		return 1
+	fi
+	if ! nginx -T 2>/dev/null | grep -Eq "configuration file (${nginx_site_link}|${nginx_site}):"; then
+		echo "Warning: nginx did not load the AccessPopup site. Check the nginx configuration."
+	fi
+	rm -f "$backup"
+	systemctl enable nginx >/dev/null 2>&1
+	if systemctl is-active --quiet nginx; then
+		systemctl reload nginx >/dev/null 2>&1 || echo "nginx is running but could not be reloaded. It will be reloaded when ${ip} is available."
+	else
+		if ! systemctl start nginx >/dev/null 2>&1; then
+			echo "nginx could not be started. It will be retried when ${ip} is available."
+		fi
+	fi
+	return 0
+}
+
+#NetworkManager runs this when an interface comes up, so nginx starts once the AP address exists
+add_nginx_dispatcher()
+{
+	mkdir -p "$(dirname "$nginx_dispatch")" || return 1
+	cat > "$nginx_dispatch" <<'EOF'
+#!/bin/sh
+# Reload nginx when the AccessPopup access point address is configured.
+# Installed by the AccessPopup installer.
+
+case "$2" in
+	up|dhcp4-change) ;;
+	*) exit 0 ;;
+esac
+
+AP_IP="$(sed -n "s/^[[:space:]]*ap_ip=['\"]\{0,1\}\([0-9.]*\).*/\1/p" /etc/accesspopup.conf 2>/dev/null | head -n1)"
+[ -n "$AP_IP" ] || exit 0
+ip -4 addr show dev "$1" 2>/dev/null | grep -Fq "inet $AP_IP/" || exit 0
+
+if systemctl is-active --quiet nginx; then
+	systemctl reload nginx >/dev/null 2>&1 || systemctl restart nginx >/dev/null 2>&1
+else
+	systemctl start nginx >/dev/null 2>&1
+fi
+exit 0
+EOF
+	chmod 755 "$nginx_dispatch"
+}
+
+configure_nginx()
+{
+	if ! command -v nginx >/dev/null 2>&1; then
+		echo "nginx is not installed, skipping the port 80 site configuration."
+		return 1
+	fi
+	if ! add_nginx_site; then
+		echo "Unable to configure the nginx site for AccessPopup."
+		return 1
+	fi
+	if ! add_nginx_dispatcher; then
+		echo "Unable to install the NetworkManager dispatcher for nginx."
+		return 1
+	fi
+	return 0
+}
+
+remove_nginx_site()
+{
+	rm -f "$nginx_site_link" "$nginx_site" "$nginx_dispatch"
+	if [ -d "$nginx_enabled" ] && [ -z "$(ls -A "$nginx_enabled" 2>/dev/null)" ]; then
+		rm -f "$nginx_include"
+	fi
+	if systemctl is-active --quiet nginx; then
+		systemctl reload nginx >/dev/null 2>&1
+	fi
 }
 
 
@@ -254,6 +443,9 @@ web_setup()
 			}
 		done
 	fi
+	if ! install_nginx; then
+		echo "nginx could not be installed. The web app will still be available on port ${web_port}."
+	fi
 
 	if release_info; then
 		cur="$(cat "${cpath}.release" 2>/dev/null)"
@@ -272,6 +464,10 @@ web_setup()
 		add_web_app_service
 		systemctl daemon-reload
 		systemctl enable --now "$webapp"
+		if ! configure_nginx; then
+			echo "The nginx port 80 forwarding could not be configured."
+			echo "The web app is still available on port ${web_port}."
+		fi
 	else
 		echo "Unable to complete the web setup. Removing any installed files."
 		uninstall_web
@@ -287,9 +483,12 @@ install_web()
 		config_web
 		echo ""
 		echo -e $YEL"The web app has been installed."
-		echo "In a web browser use http://localhost:8080 on this device or"
-		echo -e "from another device use the http://ip_address:8080 or the http://hostname:8080"
-		echo -e "From devices connected to the Access Point use http://192.168.50.1:8080" $DEF
+		echo "In a web browser use http://localhost:${web_port} on this device or"
+		echo -e "from another device use the http://ip_address:${web_port} or the http://hostname:${web_port}"
+		echo -e "From devices connected to the Access Point use http://$(ap_ip_address)" $DEF
+		if [ -f "$nginx_site" ]; then
+			echo "Port 80 on the Access Point is forwarded to port ${web_port}."
+		fi
 	fi
 	read -p "Press any key to continue"
 }
@@ -317,6 +516,9 @@ elif systemctl -all list-unit-files "$webapp" | grep "${webapp} disabled" >/dev/
 	echo "Enabeling AccessPopup Web app"
 	systemctl enable "$webapp" >/dev/null 2>&1
 	systemctl start "$webapp" >/dev/null 2>&1
+	if ! install_nginx || ! configure_nginx; then
+		echo "The nginx port 80 forwarding could not be configured."
+	fi
 fi
 }
 
@@ -629,6 +831,11 @@ ap_change_ip()
 			echo -e ${YEL}$ipa${DEF}
 			sed -i "s/ap_ip=.*/ap_ip='$ipa\\/24'/" "${conf_path}${conf_file}"
 			sed -i "s/ap_gate=.*/ap_gate='$ipg'/" "${conf_path}${conf_file}"
+
+			if command -v nginx >/dev/null 2>&1 && [ -f "$nginx_site" ]; then
+				echo "Updating the nginx site for the new Access Point address"
+				configure_nginx
+			fi
 
 			prof="$( grep -F 'ap_profile_name=' ${script_path}${scriptname} )"
 			pro="$(nmcli -t -f NAME con show | grep ${prof:17:-1} )"
@@ -1070,6 +1277,13 @@ update_release()
 	if [ $rc -eq 0 ] && [ -d "$web_path" ]; then
 		echo "Updating the web app in $web_path"
 		deploy_web "$rel_tmp/src/ap_web" || rc=1
+		if [ $rc -eq 0 ]; then
+			if install_nginx && configure_nginx; then
+				echo "The nginx port 80 forwarding has been updated."
+			else
+				echo "The nginx port 80 forwarding could not be updated."
+			fi
+		fi
 	elif [ $rc -eq 0 ]; then
 		echo "The web app is not installed, only the project files were updated."
 	fi
@@ -1199,6 +1413,8 @@ uninstall()
 
 uninstall_web()
 {
+	#Remove nginx site and NetworkManager dispatcher
+	remove_nginx_site
 	#Remove webfiles if exist
 	if [ -d $web_path ]; then
 		rm -r $web_path
