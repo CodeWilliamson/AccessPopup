@@ -1,14 +1,48 @@
 #!/bin/bash
-ver="1.01: 15th April 2026"
-#Copyright Graeme Richards - RaspberryConnect.com
+#Original Copyright Graeme Richards - RaspberryConnect.com
 #Released under the GPL3 Licence (https://www.gnu.org/licenses/gpl-3.0.en.html)
 
 #Installation and configuration script for the AccessPopup script, that switches between
 #a Wifi Access Point or connects to a Wifi Network as required
 
+#Run this script directly from GitHub without downloading a release:
+#curl -fsSL https://raw.githubusercontent.com/CodeWilliamson/AccessPopup/main/installconfig.sh | sudo bash
+#It downloads the latest published release and offers to install or update.
+
 osver=($(cat /etc/issue))
-cpath="$( cd "$( dirname "${BASH_SOURCE[0]}" )" >/dev/null 2>&1 && pwd )/"
+standalone="n"
+cpath=""
+if [ -n "${BASH_SOURCE[0]:-}" ] && [ -f "${BASH_SOURCE[0]}" ]; then
+	cpath="$( cd "$( dirname "${BASH_SOURCE[0]}" )" >/dev/null 2>&1 && pwd )/"
+fi
+#Without a local release folder the script was piped from the GitHub raw URL
+if [ -z "$cpath" ] || [ ! -f "${cpath}accesspopup" ] || [ ! -f "${cpath}accesspopup.conf" ]; then
+	standalone="y"
+	cpath=""
+fi
 wdev0="wlan0"
+
+#When the script comes from a pipe, read prompts from the terminal instead
+if [ "$standalone" = "y" ] && [ ! -t 0 ]; then
+	if ! { exec 3</dev/tty; } 2>/dev/null; then
+		echo "A terminal is required to run the installer."
+		echo "Run it from an interactive shell, or use:"
+		echo "sudo bash -c \"\$(curl -fsSL https://raw.githubusercontent.com/CodeWilliamson/AccessPopup/main/installconfig.sh)\""
+		exit 1
+	fi
+	read() { builtin read -u 3 "$@"; }
+fi
+
+#Reads a key press from the terminal even when the script itself came from a pipe
+pause_key()
+{
+	local msg="${1:-Press a key to continue}"
+	if [ -t 0 ]; then
+		read -p "$msg" _
+	elif [ -c /dev/tty ]; then
+		read -p "$msg" _ < /dev/tty
+	fi
+}
 
 script_path="/usr/local/bin/"
 scriptname="accesspopup"
@@ -26,6 +60,11 @@ service=AccessPopup.service
 timer=AccessPopup.timer
 webapp=ap_web_app.service
 sudoers_file="/etc/sudoers.d/apu"
+
+#Captive portal system settings
+dnsmasq_shared_dir="/etc/NetworkManager/dnsmasq-shared.d"
+dnsmasq_shared_conf="${dnsmasq_shared_dir}/captive-portal.conf"
+polkit_nm_rules="/usr/share/polkit-1/rules.d/org.freedesktop.NetworkManager.rules"
 
 #nginx
 web_port="8080"
@@ -51,13 +90,13 @@ if [ -z "${nm//[0-9]}" ] && [ "${osver[0]}" != 'Arch' ] ;then
 		echo "This script only works on PIOS 11 Bullseye if Network Manager has been enabled"
 		echo "in raspi-config."
 		echo "For other distributions Network Manager is required."
-		read -p "Press a key to continue"
+		pause_key
 	elif [ "${osver[2]}" -lt 11 ];then #older OS
 		echo "The version of PiOS is too old for the $scriptname script"
 		echo "Version 11 'Bullseye' with Network Manager enabled in raspi-config is the minimum requirement"
 		echo "A version for your OS is available at RaspberryConnect.com using dhcpcd instead."
 		echo "www.raspberryconnect.com/projects/65-raspberrypi-hotspot-accesspoints/183-raspberry-pi-automatic-hotspot-and-static-hotspot-installer"
-		read -p "Press any key to continue"
+		pause_key "Press any key to continue"
 		exit 1
 	fi
 fi
@@ -66,7 +105,7 @@ readlink /sbin/init | grep systemd >/dev/null 2>&1
 if [ "$?" -gt 0 ] ;then
 	echo "systemd is not available."
 	echo "This script uses SystemD services. Unable to continue."
-	read -p "Press a key to continue"
+	pause_key
 	exit 1
 fi
 
@@ -76,7 +115,7 @@ if [ $? -ne 0 ];then
 	echo "NetworkManager is not available."
 	echo "This script requires NetworkManager but it is not active."
 	echo "Unable to continue"
-	read -p "Press a key to continue"
+	pause_key
 	exit 1
 fi
 
@@ -176,13 +215,13 @@ install_nginx()
 	local pm="$(packageman)"
 	case "$pm" in
 		apt)
-			apt install nginx
+			apt install nginx < /dev/tty
 			;;
 		dnf)
-			dnf install nginx
+			dnf install nginx < /dev/tty
 			;;
 		pacman)
-			pacman -S nginx
+			pacman -S nginx < /dev/tty
 			;;
 		*)
 			echo "Unable to determine the package manager. nginx must be installed manually."
@@ -329,6 +368,103 @@ remove_nginx_site()
 	fi
 }
 
+#Answers every DNS request with the Access Point address, so a captive portal
+#can be shown for any domain requested by a connected device
+add_dnsmasq_shared()
+{
+	local ip
+	ip="$(ap_ip_address)"
+	if ! mkdir -p "$dnsmasq_shared_dir"; then
+		echo "Unable to create $dnsmasq_shared_dir. Captive portal DNS will not work."
+		return 1
+	fi
+	if ! cat > "$dnsmasq_shared_conf" <<EOF
+interface=${wdev0}
+listen-address=${ip}
+address=/#/${ip}
+EOF
+	then
+		echo "Unable to create $dnsmasq_shared_conf. Captive portal DNS will not work."
+		return 1
+	fi
+	echo "Created the shared dnsmasq configuration for the captive portal."
+	return 0
+}
+
+#Lets the apu user manage NetworkManager without a password prompt
+add_polkit_rule()
+{
+	local rule='polkit.addRule(function(action, subject) { if (action.id.indexOf("org.freedesktop.NetworkManager.") == 0 && subject.user == "apu") { return polkit.Result.YES; } });'
+
+	if [ ! -d "$(dirname "$polkit_nm_rules")" ]; then
+		echo "The polkit rules directory was not found. Skipping the NetworkManager rule."
+		return 1
+	fi
+	if [ -f "$polkit_nm_rules" ] && grep -Fq 'subject.user == "apu"' "$polkit_nm_rules"; then
+		echo "The NetworkManager polkit rule for apu is already present."
+		return 0
+	fi
+	#Start the rule on a new line when the existing file does not end with one
+	if [ -s "$polkit_nm_rules" ] && [ -n "$(tail -c 1 "$polkit_nm_rules")" ]; then
+		printf '\n' >> "$polkit_nm_rules" || {
+			echo "Unable to update $polkit_nm_rules."
+			return 1
+		}
+	fi
+	if ! printf '%s\n' "$rule" >> "$polkit_nm_rules"; then
+		echo "Unable to update $polkit_nm_rules."
+		return 1
+	fi
+	echo "Added the NetworkManager polkit rule for the apu user."
+	return 0
+}
+
+#Adds quiet to the kernel command line to reduce the boot text on the screen
+add_cmdline_quiet()
+{
+	local f="" cand
+	for cand in /boot/firmware/cmdline.txt /boot/cmdline.txt; do
+		if [ -f "$cand" ]; then
+			f="$cand"
+			break
+		fi
+	done
+	if [ -z "$f" ]; then
+		echo "cmdline.txt was not found. Skipping the quiet boot option."
+		return 1
+	fi
+	if grep -Eq '(^|[[:space:]])quiet([[:space:]]|$)' "$f"; then
+		echo "quiet is already set in $f."
+		return 0
+	fi
+	#cmdline.txt must stay a single line, so add quiet to the end of that line
+	local line
+	line="$(tr -d '\r\n' < "$f")" || {
+		echo "Unable to read $f."
+		return 1
+	}
+	#Strip any trailing whitespace before adding quiet
+	if ! printf '%s quiet\n' "${line%"${line##*[![:space:]]}"}" > "$f"; then
+		echo "Unable to add quiet to $f."
+		return 1
+	fi
+	if ! grep -Eq '(^|[[:space:]])quiet([[:space:]]|$)' "$f"; then
+		echo "Unable to add quiet to $f."
+		return 1
+	fi
+	echo "Added quiet to $f. It takes effect on the next boot."
+	return 0
+}
+
+#Applies the system settings that AccessPopup relies on
+configure_system_settings()
+{
+	add_dnsmasq_shared
+	add_polkit_rule
+	add_cmdline_quiet
+	return 0
+}
+
 
 webcheck()
 {
@@ -391,7 +527,7 @@ release_download()
 	if ! curl -fsSL --max-time 120 -o "$rel_tmp/release.tar.gz" "$rel_url" || ! tar -xzf "$rel_tmp/release.tar.gz" -C "$rel_tmp/src" --strip-components=1; then
 		bad="The download failed."
 	else
-		for f in installconfig.sh accesspopup ap_web/app.py ap_web/requirements.txt; do
+		for f in installconfig.sh accesspopup accesspopup.conf nw_setup_offline.sh ap_web/app.py ap_web/requirements.txt; do
 			[ -f "$rel_tmp/src/$f" ] || bad="The release is missing $f."
 		done
 	fi
@@ -399,6 +535,28 @@ release_download()
 		echo "$bad"
 		rm -rf "$rel_tmp"; rel_tmp=""
 		return 1
+	fi
+}
+
+#Returns the release tag recorded for the installed AccessPopup
+installed_release()
+{
+	local f="${script_path}.release"
+	[ -f "$f" ] && head -n1 "$f"
+}
+
+#Records the release tag for the installed AccessPopup
+record_installed_release()
+{
+	local tag=""
+	if [ -f "${cpath}.release" ]; then
+		tag="$(head -n1 "${cpath}.release")"
+	fi
+	if [ -z "$tag" ] && [ "$standalone" = "y" ]; then
+		tag="${rel_tag:-}"
+	fi
+	if [ -n "$tag" ]; then
+		printf '%s\n' "$tag" > "${script_path}.release"
 	fi
 }
 
@@ -436,7 +594,7 @@ web_setup()
 	fi
 	if [ "$pm" = 'apt' ]; then
 		for i in "${depend[@]}"; do
-			dpkg -s "$i" >/dev/null 2>&1 || apt install "$i" || {
+			dpkg -s "$i" >/dev/null 2>&1 || apt install "$i" < /dev/tty || {
 				echo "Unable to install dependency $i"
 				echo "This may be because there is no internet access or the package is unavailable"
 				return 1
@@ -447,7 +605,10 @@ web_setup()
 		echo "nginx could not be installed. The web app will still be available on port ${web_port}."
 	fi
 
-	if release_info; then
+	if [ "$standalone" = "y" ]; then
+		#The release has already been downloaded by run_standalone
+		src="${cpath}ap_web"
+	elif release_info; then
 		cur="$(cat "${cpath}.release" 2>/dev/null)"
 		if [ "$cur" = "$rel_tag" ] && [ -f "${cpath}ap_web/app.py" ]; then
 			echo "The local web app files are already the latest release ($rel_tag)"
@@ -589,7 +750,7 @@ if [ -f "./$scriptname" ]; then
 		for i in "${depend1[@]}"; do
 			dpkg -s "$i" >/dev/null 2>&1
 			if [ $? -gt 0 ]; then
-				apt install "$i"
+				apt install "$i" < /dev/tty
 				if [ $? -gt 0 ] ;then
 					echo "Unable to install dependency ${depend1[@]}"
 					echo "AccessPopup cannot be installed."
@@ -610,7 +771,7 @@ if [ -f "./$scriptname" ]; then
 	if [ "$pm" = 'dnf' ];then
 		for i in "${depend2[@]}"; do
 			if [ $? -gt 0 ]; then
-				dnf install "$i"
+				dnf install "$i" < /dev/tty
 				if [ $? -gt 0 ] ;then
 					echo "Unable to install dependency ${depend2[@]}"
 					echo "AccessPopup cannot be installed."
@@ -632,7 +793,7 @@ if [ -f "./$scriptname" ]; then
 		for i in "${depend2[@]}" ; do
 			pacman -Qi "$i" >/dev/null 2>&1
 			if [ $? -gt 0 ]; then
-				pacman -S "$i"
+				pacman -S "$i" < /dev/tty
 				if [ $? -gt 0 ] ;then
 					echo "Unable to install dependency ${depend2[@]}"
 					echo "AccessPopup cannot be installed."
@@ -682,6 +843,7 @@ if [ -f "./$scriptname" ]; then
 	cp "./$scriptname" "$script_path"
 	cp "./$conf_file" "${conf_path}${conf_file}"
 	chmod +x "${script_path}${scriptname}"
+	configure_system_settings
 	#Install the web app before the network script runs, as it may take the device offline
 	install_web
 	add_service
@@ -689,8 +851,11 @@ if [ -f "./$scriptname" ]; then
 	systemctl start $timer
 	"${script_path}${scriptname}"
 	chmod +x ./nw_setup_offline.sh
+	record_installed_release
 	echo -e "\nAccessPopup has been installed"
-	read -p "Press any key to continue"
+	if [ "${auto_action:-0}" -ne 1 ]; then
+		read -p "Press any key to continue"
+	fi
 else
 	echo "$scriptname is not in the same location as this installer"
 	echo "Unable to continue"
@@ -835,6 +1000,11 @@ ap_change_ip()
 			if command -v nginx >/dev/null 2>&1 && [ -f "$nginx_site" ]; then
 				echo "Updating the nginx site for the new Access Point address"
 				configure_nginx
+			fi
+
+			if [ -f "$dnsmasq_shared_conf" ]; then
+				echo "Updating the shared dnsmasq configuration for the new Access Point address"
+				add_dnsmasq_shared
 			fi
 
 			prof="$( grep -F 'ap_profile_name=' ${script_path}${scriptname} )"
@@ -1168,7 +1338,7 @@ devices()
 		echo
 		read -p "press any key to continue"
 	else
-		while IFS= read -r line; do
+		while IFS= builtin read -r line; do
 			sorted_pairs+=("$line")
 		done < <(
 			for pair in "${devs[@]}"; do
@@ -1176,7 +1346,7 @@ devices()
 			done | sort -k1,1   # Sorts by key
 		)
 		for i in "${sorted_pairs[@]}"; do
-			read key val <<< "$i"
+			builtin read key val <<< "$i"
 			[[ "$wdev0" = "wlan0" && ( "$key" == "wi" || "$key" == "wx" ) ]] && wdev0="$val"
 		done
 	fi
@@ -1252,6 +1422,11 @@ update_release()
 	local cur ans f
 	local rc=0
 
+	if [ "$standalone" = "y" ]; then
+		update_release_standalone
+		return
+	fi
+
 	release_info || { read -p "Press any key to continue"; return 1; }
 	cur="$(cat "${cpath}.release" 2>/dev/null)"
 	echo "Installed release: ${cur:-unknown}"
@@ -1270,7 +1445,7 @@ update_release()
 
 	echo "Updating project files in $cpath"
 	#Write to a temp name then mv, so the running installer keeps reading its original file
-	while IFS= read -r -d '' f; do
+	while IFS= builtin read -r -d '' f; do
 		mkdir -p "$(dirname "${cpath}${f}")" && cp -p "$rel_tmp/src/$f" "${cpath}${f}.new" && mv -f "${cpath}${f}.new" "${cpath}${f}" || { rc=1; break; }
 	done < <(cd "$rel_tmp/src" && find . -type f -print0)
 
@@ -1301,6 +1476,149 @@ update_release()
 	echo -e $YEL"Updated to release $rel_tag"$DEF
 	read -p "Press any key to restart the installer"
 	exec bash "${cpath}installconfig.sh"
+}
+
+#Updates the installed files from the release already downloaded to $release_src_dir
+update_installed_release()
+{
+	local src="${release_src_dir:-}" cur rc=0
+
+	if [ ! -f "$src/accesspopup" ]; then
+		echo "The downloaded release is not available."
+		return 1
+	fi
+	cur="$(installed_release)"
+	echo "Updating AccessPopup from ${cur:-unknown} to $rel_tag"
+	echo "Updating ${script_path}${scriptname}"
+	if ! install -m 755 "$src/accesspopup" "${script_path}${scriptname}.new" \
+		|| ! mv -f "${script_path}${scriptname}.new" "${script_path}${scriptname}"; then
+		rm -f "${script_path}${scriptname}.new"
+		echo "Unable to update ${script_path}${scriptname}."
+		read -p "Press any key to continue"
+		return 1
+	fi
+
+	if [ -d "$web_path" ]; then
+		echo "Updating the web app in $web_path"
+		deploy_web "$src/ap_web" || rc=1
+		if [ $rc -eq 0 ]; then
+			if install_nginx && configure_nginx; then
+				echo "The nginx port 80 forwarding has been updated."
+			else
+				echo "The nginx port 80 forwarding could not be updated."
+			fi
+		fi
+	else
+		echo "The web app is not installed, only the accesspopup script was updated."
+	fi
+	if [ $rc -ne 0 ]; then
+		echo "The update failed part way through. The release marker was not changed."
+		read -p "Press any key to continue"
+		return 1
+	fi
+
+	add_service
+	add_timer_service
+	systemctl start "$timer" >/dev/null 2>&1
+	systemctl daemon-reload >/dev/null 2>&1
+	configure_system_settings
+	printf '%s\n' "$rel_tag" > "${script_path}.release"
+	echo -e $YEL"Updated to release $rel_tag"$DEF
+	if [ "${auto_action:-0}" -ne 1 ]; then
+		read -p "Press any key to continue"
+	fi
+	return 0
+}
+
+#Offers the full installer menu or exits after an automatic install or update
+menu_or_exit()
+{
+	local choice
+	auto_action=0
+	echo ""
+	read -p "Press Enter to exit, or type m and press Enter to open the full menu: " choice
+	if [[ "$choice" =~ ^[Mm]$ ]]; then
+		menu
+	fi
+}
+
+#Updates the installed files from the release downloaded when the installer started
+update_release_standalone()
+{
+	local cur ans
+
+	cur="$(installed_release)"
+	echo "Installed release:  ${cur:-unknown}"
+	echo "Downloaded release: $rel_tag"
+	if [ -n "$cur" ] && [ "$cur" = "$rel_tag" ]; then
+		echo "Already up to date."
+		read -p "Press any key to continue"
+		return 0
+	fi
+	read -p "Update to $rel_tag now? [Y/n] " ans
+	if [[ "$ans" =~ ^[Nn] ]]; then
+		return 0
+	fi
+	update_installed_release
+}
+
+#Downloads the latest release and runs an install or update when the script was piped from curl
+run_standalone()
+{
+	local cur ans rc=0
+
+	if [ "$(id -u)" -ne 0 ]; then
+		echo "The standalone installer must be run as root."
+		echo "Use: curl -fsSL https://raw.githubusercontent.com/CodeWilliamson/AccessPopup/main/installconfig.sh | sudo bash"
+		return 1
+	fi
+
+	echo -e $YEL"AccessPopup installer"$DEF
+	echo "The latest published release will be checked on GitHub."
+	release_info || { read -p "Press any key to continue"; return 1; }
+	release_download || { read -p "Press any key to continue"; return 1; }
+
+	#Use the downloaded release for the install, update and the full menu
+	cpath="$rel_tmp/src/"
+	release_src_dir="$rel_tmp/src"
+	release_tmp_root="$rel_tmp"
+	trap 'rm -rf "$release_tmp_root"' EXIT
+	cd "$cpath" || { echo "Unable to enter the downloaded release."; return 1; }
+
+	cur="$(installed_release)"
+	if [ -f "${script_path}${scriptname}" ]; then
+		echo "Installed release: ${cur:-unknown}"
+		echo "Latest release:    $rel_tag"
+		if [ -n "$cur" ] && [ "$cur" = "$rel_tag" ]; then
+			echo "AccessPopup is already up to date."
+			menu_or_exit
+			return 0
+		fi
+		read -p "Update to $rel_tag now? [Y/n] " ans
+		if [[ "$ans" =~ ^[Nn] ]]; then
+			echo "Nothing has been changed."
+			menu_or_exit
+			return 0
+		fi
+		auto_action=1
+		update_installed_release || rc=1
+	else
+		echo "AccessPopup is not installed."
+		echo "Latest release: $rel_tag"
+		read -p "Install AccessPopup $rel_tag now? [Y/n] " ans
+		if [[ "$ans" =~ ^[Nn] ]]; then
+			echo "Nothing has been changed."
+			menu_or_exit
+			return 0
+		fi
+		devices
+		auto_action=1
+		install_general || rc=1
+	fi
+	if [ $rc -eq 0 ]; then
+		menu_or_exit
+	fi
+	return $rc
 }
 
 config_web()
@@ -1407,6 +1725,7 @@ uninstall()
 		rm "${script_path}${scriptname}"
 		rm "${conf_path}${conf_file}"
 	fi
+	rm -f "${script_path}.release"
 	echo "Uninstalled AccessPopup Files"
 	uninstall_web
 }
@@ -1595,5 +1914,10 @@ menu_more()
 	esac
 done
 }
+
+if [ "$standalone" = "y" ]; then
+	run_standalone
+	exit $?
+fi
 devices
 menu
