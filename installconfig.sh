@@ -20,7 +20,8 @@ if [ -z "$cpath" ] || [ ! -f "${cpath}accesspopup" ] || [ ! -f "${cpath}accesspo
 	standalone="y"
 	cpath=""
 fi
-wdev0="wlan0"
+wdev0="${WIFI_DEVICE:-wlan0}"
+ap_profile_name="AccessPopup"
 
 #When the script comes from a pipe, read prompts from the terminal instead
 if [ "$standalone" = "y" ] && [ ! -t 0 ]; then
@@ -50,6 +51,16 @@ conf_path="/etc/"
 conf_file="accesspopup.conf"
 web_path="/usr/local/bin/ap_web"
 webfile_app="/usr/local/bin/ap_web/app.py"
+
+#Use the installed configuration so menu actions and updates keep the device
+#that AccessPopup actually runs with. An explicit WIFI_DEVICE wins.
+if [ -f "${conf_path}${conf_file}" ]; then
+	conf_wdev="$(sed -n "s/^[[:space:]]*wdev0=['\"]\{0,1\}\([^'\"]*\)['\"]\{0,1\}.*/\1/p" "${conf_path}${conf_file}" 2>/dev/null | head -n1)"
+	[ -n "$conf_wdev" ] && [ -z "${WIFI_DEVICE:-}" ] && wdev0="$conf_wdev"
+	conf_ap="$(sed -n "s/^[[:space:]]*ap_profile_name=['\"]\{0,1\}\([^'\"]*\)['\"]\{0,1\}.*/\1/p" "${conf_path}${conf_file}" 2>/dev/null | head -n1)"
+	[ -n "$conf_ap" ] && ap_profile_name="$conf_ap"
+fi
+
 active_ap="n"
 active=""
 nw_profile=()
@@ -119,6 +130,95 @@ if [ $? -ne 0 ];then
 	exit 1
 fi
 
+#Returns 0 when $1 is a wireless network interface on this system
+is_wifi_device()
+{
+	local dev="${1:-$wdev0}"
+	[ -n "$dev" ] && [ -d "/sys/class/net/${dev}/wireless" ]
+}
+
+#Describes whether a wireless interface is an external USB adapter
+wifi_device_kind()
+{
+	local path
+	path="$(readlink -f "/sys/class/net/${1}/device" 2>/dev/null)"
+	if printf '%s' "$path" | grep -q '/usb'; then
+		printf 'external USB\n'
+	else
+		printf 'built-in\n'
+	fi
+}
+
+#Lists the wireless interfaces on this system, one per line
+wifi_device_list()
+{
+	local dev
+	for dev in /sys/class/net/*; do
+		[ -e "$dev" ] || continue
+		dev="$(basename "$dev")"
+		is_wifi_device "$dev" && printf '%s\n' "$dev"
+	done
+}
+
+#Replaces key='value' in a shell-style config file, or appends it
+set_config_value()
+{
+	local file="$1" key="$2" value="$3"
+	[ -f "$file" ] || return 1
+	if grep -q "^[[:space:]]*${key}=" "$file"; then
+		sed -i "s|^[[:space:]]*${key}=.*|${key}='${value}'|" "$file"
+	else
+		printf "\n%s='%s'\n" "$key" "$value" >> "$file"
+	fi
+}
+
+#Sets Environment="KEY=value" in the [Service] section of a systemd unit.
+#Returns 0 when the file changed and 1 when it was already correct.
+set_service_env()
+{
+	local unit="$1" key="$2" value="$3" line
+	[ -f "$unit" ] || return 1
+	line="Environment=\"${key}=${value}\""
+	if grep -q "^Environment=\"\{0,1\}${key}=" "$unit"; then
+		[ "$(grep -m1 "^Environment=\"\{0,1\}${key}=" "$unit")" = "$line" ] && return 1
+		sed -i "s|^Environment=\"\{0,1\}${key}=.*|${line}|" "$unit" || return 1
+	else
+		sed -i "/^\[Service\]/a ${line}" "$unit" || return 1
+	fi
+	return 0
+}
+
+#Makes the web app follow the configured wireless device and AP profile
+update_web_service_device()
+{
+	local unit="${sysd_path}${webapp}" changed=0
+	[ -f "$unit" ] || return 0
+	set_service_env "$unit" WIFI_INTERFACE "$wdev0" && changed=1
+	set_service_env "$unit" AP_CONNECTION "$ap_profile_name" && changed=1
+	if [ "$changed" -eq 1 ]; then
+		systemctl daemon-reload >/dev/null 2>&1
+		if systemctl is-active --quiet "$webapp"; then
+			systemctl restart "$webapp" >/dev/null 2>&1
+		fi
+	fi
+	return 0
+}
+
+#Writes the selected device to /etc/accesspopup.conf and refreshes the
+#services that depend on it
+persist_wifi_device()
+{
+	set_config_value "${conf_path}${conf_file}" wdev0 "$wdev0"
+	update_web_service_device
+	if [ -f "$dnsmasq_shared_conf" ]; then
+		add_dnsmasq_shared >/dev/null
+	fi
+	#Keep the saved AP profile on the same adapter
+	if nmcli -t -f NAME connection show 2>/dev/null | grep -Fxq "$ap_profile_name"; then
+		nmcli connection modify "$ap_profile_name" connection.interface-name "$wdev0" >/dev/null 2>&1 || true
+	fi
+}
+
 add_service()
 {
 if ! systemctl list-unit-files --all | grep $service ;then
@@ -159,7 +259,7 @@ fi
 
 add_web_app_service()
 {
-if ! systemctl list-unit-files --all | grep $webapp ;then
+if ! systemctl list-unit-files --all | grep -q "$webapp" ;then
 	cat > "${sysd_path}${webapp}" <<EOF
 [Unit]
 Description=HammerTime Wi-Fi Provisioning Portal
@@ -171,8 +271,8 @@ Type=simple
 User=apu
 Group=apu
 WorkingDirectory=/usr/local/bin/ap_web
-Environment=WIFI_INTERFACE=wlan0
-Environment=AP_CONNECTION=HammerTime AP
+Environment="WIFI_INTERFACE=${wdev0}"
+Environment="AP_CONNECTION=${ap_profile_name}"
 Environment=WIFI_CONNECT_TIMEOUT=25
 Environment=PORTAL_HOST=0.0.0.0
 Environment=PORTAL_PORT=${web_port}
@@ -187,6 +287,8 @@ NoNewPrivileges=false
 WantedBy=multi-user.target
 EOF
 fi
+#Keep an existing unit in step with /etc/accesspopup.conf
+update_web_service_device
 }
 
 #Returns the Access Point IPv4 address from accesspopup.conf
@@ -686,14 +788,7 @@ fi
 #Function what is the current active wifi
 active_wifi()
 {
-	act="$(nmcli -t -f TYPE,NAME,DEVICE,TYPE con show --active | grep "$wdev0")" #List of active devices
-	act="$(awk 1 ORS=':' <(echo "$act"))" #Replaces LF with : Delimeter
-	readarray -d ':' -t active_name < <(printf "%s" "$act") #Change to array output
-	if [ ! -z "$active_name" ]; then
-		active="${active_name[1]}"
-	else
-		active=""
-	fi
+	active="$(nmcli -t -f NAME,DEVICE connection show --active 2>/dev/null | awk -F: -v d="$wdev0" '$2==d {print $1; exit}')"
 }
 
 is_active_ap()
@@ -834,14 +929,13 @@ if [ -f "./$scriptname" ]; then
 		fi
 	fi
 
-	if [ $wdev0 != "wlan0" ] ;then
-		echo "Updating $conf_file with device name $wdev0"
-		sed -i "s/wdev0=.*/wdev0='$wdev0'/" "./$conf_file"
-	fi
-
-
 	cp "./$scriptname" "$script_path"
 	cp "./$conf_file" "${conf_path}${conf_file}"
+	#Always persist the device selected during this install, including wlan0
+	set_config_value "${conf_path}${conf_file}" wdev0 "$wdev0" || true
+	if [ "$wdev0" != "wlan0" ]; then
+		echo "Using wifi device $wdev0 in ${conf_path}${conf_file}"
+	fi
 	chmod +x "${script_path}${scriptname}"
 	configure_system_settings
 	#Install the web app before the network script runs, as it may take the device offline
@@ -873,7 +967,6 @@ ap_ssid_change()
 		echo "SSID:${ss:8}"
 		pw="$( grep -F 'ap_pw=' ${conf_path}${conf_file} )"
 		echo "Password:${pw:6}"
-		prof="$( grep -F 'ap_profile_name=' ${script_path}${scriptname} )"
 		echo -e $YEL"Enter the new SSID"$DEF
 		echo "Press enter to keep the existing SSID"
 		read newss
@@ -893,7 +986,7 @@ ap_ssid_change()
 		echo "SSID:${ss:8}"
 		echo "Password: ${pw:6}"
 		#remove AP profile
-		pro="$(nmcli -t -f NAME con show | grep ${prof:17:-1} )"
+		pro="$(nmcli -t -f NAME con show 2>/dev/null | grep -Fx "$ap_profile_name")"
 		if [ ! -z "$pro" ]; then
 			nmcli con delete "$pro" >/dev/null 2>&1
 			nmcli con reload
@@ -1007,8 +1100,7 @@ ap_change_ip()
 				add_dnsmasq_shared
 			fi
 
-			prof="$( grep -F 'ap_profile_name=' ${script_path}${scriptname} )"
-			pro="$(nmcli -t -f NAME con show | grep ${prof:17:-1} )"
+			pro="$(nmcli -t -f NAME con show 2>/dev/null | grep -Fx "$ap_profile_name")"
 			if [ ! -z "$pro" ]; then
 				nmcli con delete "$pro" >/dev/null 2>&1
 			fi
@@ -1087,9 +1179,17 @@ setupssid()
 	ct=0; j=0 ; lp=0
 	wfselect=()
 
+	if ! is_wifi_device "$wdev0"; then
+		echo "The configured WiFi device $wdev0 is not available."
+		echo "Use Additional Menu > Change WiFi Device to select the adapter,"
+		echo "or connect the USB WiFi adapter and try again."
+		read -p "press a key to continue"
+		menu
+	fi
+
 	until [ $lp -eq 1 ] #wait for wifi if busy, usb wifi is slower.
 	do
-		IFS=$'\n:$\t' localwifi=($((iw dev $wdev0 scan ap-force | grep -E "SSID:") 2>&1)) >/dev/null 2>&1
+		IFS=$'\n:$\t' localwifi=($( (iw dev "$wdev0" scan ap-force | grep -E "SSID:") 2>&1 ))
 		#if wifi device errors recheck
 		if (($j >= 5)); then #if busy 5 times exit to menu
 			echo "WiFi Device Unavailable, cannot scan for wifi devices at this time"
@@ -1129,6 +1229,10 @@ setupssid()
 	done
 	if [ $j -eq 99 ]; then
 		menu
+	fi
+	#Some USB adapters do not support "iw scan ap-force". Fall back to NetworkManager.
+	if ! printf '%s\n' "${localwifi[@]}" | grep -q "SSID"; then
+		localwifi=($(nmcli -t -f SSID device wifi list ifname "$wdev0" 2>/dev/null | sed '/^[[:space:]]*$/d'))
 	fi
 	#Wifi Connections found - continue
 	for x in "${localwifi[@]}"
@@ -1191,8 +1295,9 @@ updatessid()
 			read ssidpw
 			if [ ! -z "$ssidpw" ] && [ ${#ssidpw} -ge 8 ] ;then
 				nmcli connection modify "$x" wifi-sec.psk "$ssidpw" >/dev/null 2>&1
+				nmcli connection modify "$x" connection.interface-name "$wdev0" >/dev/null 2>&1
 				echo "Attempting to connect to $x"
-				nmcli device wifi connect "$x" >/dev/null 2>&1
+				nmcli device wifi connect "$x" ifname "$wdev0" >/dev/null 2>&1
 				stat=$?
 				if [ $stat -eq 0 ] ; then
 					echo "Connection successful"
@@ -1225,11 +1330,12 @@ updatessid()
 		echo "Attempting to connect to the new Wifi Network"
 		if [ ! -z "$chgpw" ] && [ "${#chgpw}" -ge 8 ] ;then
 			#create new profile with details
-			nmcli device wifi connect "$1" password "$chgpw" >/dev/null 2>&1
+			nmcli device wifi connect "$1" password "$chgpw" ifname "$wdev0" >/dev/null 2>&1
 			stat=$?
 			if [ $stat -eq 0 ] ; then
 				echo "Profile Created"
 				echo "$1"
+				nmcli connection modify "$1" connection.interface-name "$wdev0" >/dev/null 2>&1
 				pw="$( nmcli -t -s con show $1 | grep 'wireless-security.psk:' )"
 				echo ${pw:29}
 				nmcli connection reload
@@ -1303,7 +1409,7 @@ ap_no_scan_options()
 				echo "Press Enter to continue"
 				read r
 				nmcli connection down $active
-				nohup ./nw_setup_offline.sh -s "$new_nw" -p "$new_pw" >/dev/null 2>&1 &
+				nohup ./nw_setup_offline.sh -s "$new_nw" -p "$new_pw" -i "$wdev0" >/dev/null 2>&1 &
 				menu
 			fi
 		fi
@@ -1316,40 +1422,99 @@ ap_no_scan_options()
 
 devices()
 {
-	local devs=()
-	local sorted_pairs=()
-	for dev in /sys/class/net/*; do
-		dev=$(basename "$dev")
-		dev_path=$(readlink -f "/sys/class/net/$dev/device")
-		if [[ -d "/sys/class/net/$dev/wireless" ]]; then
-			if echo "$dev_path" | grep 'usb' >/dev/null 2>&1; then
-				devs+=("wx ${dev}")
-			else
-				devs+=("wi ${dev}")
-			fi
-		fi
-	done
+	local force="${1:-0}"
+	local -a devs=() kinds=()
+	local dev choice i default_index=1
 
-	if [ -z "$devs" ]; then #no wifi device found
+	while IFS= read -r dev; do
+		[ -n "$dev" ] || continue
+		devs+=("$dev")
+		kinds+=("$(wifi_device_kind "$dev")")
+	done < <(wifi_device_list)
+
+	if [ ${#devs[@]} -eq 0 ]; then #no wifi device found
 		echo ""
 		echo "No Wifi device found."
 		echo "The default of wlan0 will be used. AccessPopup will not work correctly if this is incorrect."
 		echo "Manually update /etc/accesspopup.conf with the correct wifi device name when it is available"
+		echo "or use Additional Menu > Change WiFi Device once the adapter is connected."
 		echo
 		read -p "press any key to continue"
-	else
-		while IFS= builtin read -r line; do
-			sorted_pairs+=("$line")
-		done < <(
-			for pair in "${devs[@]}"; do
-			printf "%s\n" "$pair"
-			done | sort -k1,1   # Sorts by key
-		)
-		for i in "${sorted_pairs[@]}"; do
-			builtin read key val <<< "$i"
-			[[ "$wdev0" = "wlan0" && ( "$key" == "wi" || "$key" == "wx" ) ]] && wdev0="$val"
+		return 0
+	fi
+
+	#Keep the configured device while it is present, unless the user asked to change it
+	if [ "$force" -ne 1 ] && is_wifi_device "$wdev0"; then
+		return 0
+	fi
+	if [ "$force" -ne 1 ] && [ ${#devs[@]} -eq 1 ]; then
+		wdev0="${devs[0]}"
+		echo "Using WiFi device $wdev0 (${kinds[0]})"
+		return 0
+	fi
+
+	#Non-interactive install: prefer the external USB adapter
+	if [ "$force" -ne 1 ] && ! { [ -t 0 ] || [ -c /dev/tty ]; }; then
+		for i in "${!devs[@]}"; do
+			if [ "${kinds[$i]}" = "external USB" ]; then
+				wdev0="${devs[$i]}"
+				return 0
+			fi
+		done
+		wdev0="${devs[0]}"
+		return 0
+	fi
+
+	echo ""
+	echo "Available WiFi devices:"
+	for i in "${!devs[@]}"; do
+		if [ "${devs[$i]}" = "$wdev0" ]; then
+			default_index=$((i + 1))
+			printf ' %s = %s (%s) [configured]\n' "$((i + 1))" "${devs[$i]}" "${kinds[$i]}"
+		else
+			printf ' %s = %s (%s)\n' "$((i + 1))" "${devs[$i]}" "${kinds[$i]}"
+		fi
+	done
+	if ! is_wifi_device "$wdev0"; then
+		for i in "${!devs[@]}"; do
+			if [ "${kinds[$i]}" = "external USB" ]; then
+				default_index=$((i + 1))
+				break
+			fi
 		done
 	fi
+
+	while true; do
+		read -p "Select the WiFi device to use [$default_index]: " choice
+		choice="${choice:-$default_index}"
+		if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le ${#devs[@]} ]; then
+			wdev0="${devs[$((choice - 1))]}"
+			break
+		fi
+		echo "Enter a number from 1 to ${#devs[@]}."
+	done
+	echo "WiFi device set to $wdev0 (${kinds[$((choice - 1))]})"
+	return 0
+}
+
+change_wifi_device()
+{
+	echo -e $YEL$BOL"Change the WiFi Device"$DEF
+	if [ -z "$(wifi_device_list)" ]; then
+		echo "No Wifi device found."
+		echo "Connect the adapter and try again."
+		read -p "press any key to continue"
+		return 1
+	fi
+	echo "The current device is $wdev0"
+	devices 1
+	if [ -f "${conf_path}${conf_file}" ]; then
+		persist_wifi_device
+		echo "AccessPopup and the web app will use $wdev0 from the next network check."
+	else
+		echo "AccessPopup is not installed. $wdev0 will be used when it is installed."
+	fi
+	read -p "press any key to continue"
 }
 
 create_user()
@@ -1462,6 +1627,12 @@ update_release()
 	elif [ $rc -eq 0 ]; then
 		echo "The web app is not installed, only the project files were updated."
 	fi
+	if [ $rc -eq 0 ]; then
+		if [ -f "${sysd_path}${webapp}" ]; then
+			add_web_app_service
+		fi
+		configure_system_settings
+	fi
 	rm -rf "$rel_tmp"
 
 	if [ $rc -ne 0 ]; then
@@ -1519,6 +1690,9 @@ update_installed_release()
 
 	add_service
 	add_timer_service
+	if [ -f "${sysd_path}${webapp}" ]; then
+		add_web_app_service
+	fi
 	systemctl start "$timer" >/dev/null 2>&1
 	systemctl daemon-reload >/dev/null 2>&1
 	configure_system_settings
@@ -1719,8 +1893,7 @@ uninstall()
 	fi
 	#Remove AP and NM profile
 	if [ -f "${script_path}${scriptname}" ]; then
-		profap="$( grep -F ap_profile_name= ${conf_path}${conf_file} )"
-		nmcli con delete "${profap:17:-1}" >/dev/null 2>&1
+		nmcli con delete "$ap_profile_name" >/dev/null 2>&1
 		nmcli con reload
 		rm "${script_path}${scriptname}"
 		rm "${conf_path}${conf_file}"
@@ -1818,6 +1991,8 @@ go()
 		update_release
 	elif [ "$opt" = "CFG" ] ;then
 		config_web
+	elif [ "$opt" = "DEV" ] ;then
+		change_wifi_device
 	fi
 	clear
 	menu
@@ -1890,7 +2065,7 @@ menu_more()
 {
 	#Additional menu
 	clear
-	until [ "$select" = "6" ]; do #set number to qty of menu options
+	until [ "$select" = "7" ]; do #set number to qty of menu options
 	echo -e $YEL"Raspberryconnect.com"
 	echo "AccessPopup installation and setup"
 	echo -e "Additional Options"$DEF
@@ -1900,7 +2075,8 @@ menu_more()
 	echo " 3 = When Wifi is Disabled: Automatically re-activate Y/N"
 	echo " 4 = Uninstall $scriptname"
 	echo " 5 = Configure the Web app (product name and logo)"
-	echo " 6 = Back to the Main menu"
+	echo " 6 = Change the WiFi Device (for example wlan1 USB adapter)"
+	echo " 7 = Back to the Main menu"
 	echo -e -n "\nSelect an Option:"
 	read select
 	case $select in
@@ -1909,7 +2085,8 @@ menu_more()
 	3) clear ; go "DIS" ;; #Wifi reactivation options
 	4) clear ; go "UNI" ;; #Uninstall AccessPopup
 	5) clear ; go "CFG" ;; #Configure web app branding
-	6) clear ; menu ;;
+	6) clear ; go "DEV" ;; #Change the WiFi device
+	7) clear ; menu ;;
 	*) Clear ; echo -e "Please select again\n";;
 	esac
 done

@@ -15,10 +15,35 @@ app.config["PRODUCT_NAME"] = "Raspberry Pi"
 # Override via environment, e.g. FLASK_PRODUCT_NAME="My Product"
 app.config.from_prefixed_env()
 
-WIFI_INTERFACE = os.getenv("WIFI_INTERFACE", "wlan0")
-AP_CONNECTION = os.getenv("AP_CONNECTION", "HammerTime AP")
-CONNECT_TIMEOUT = int(os.getenv("WIFI_CONNECT_TIMEOUT", "25"))
+CONF_FILE = os.getenv("ACCESSPOPUP_CONF", "/etc/accesspopup.conf")
 
+
+def _conf_value(key, default):
+    """Read a value from the installed AccessPopup configuration file."""
+    try:
+        with open(CONF_FILE, "r", encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                name, value = line.split("=", 1)
+                if name.strip() != key:
+                    continue
+                value = value.strip()
+                if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
+                    value = value[1:-1]
+                return value or default
+    except OSError:
+        pass
+    return default
+
+
+# The config file is the runtime source of truth, so changing wdev0 there is
+# enough even if an older service unit still has a stale WIFI_INTERFACE value.
+# The environment is the fallback for manual runs without an installed config.
+WIFI_INTERFACE = _conf_value("wdev0", "") or os.getenv("WIFI_INTERFACE", "wlan0")
+AP_CONNECTION = _conf_value("ap_profile_name", "") or os.getenv("AP_CONNECTION", "AccessPopup")
+CONNECT_TIMEOUT = int(os.getenv("WIFI_CONNECT_TIMEOUT", "25"))
 wifi = WiFiManager(
     interface=WIFI_INTERFACE,
     ap_connection=AP_CONNECTION,

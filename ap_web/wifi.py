@@ -79,6 +79,31 @@ class WiFiManager:
         fields.append("".join(current))
         return fields
 
+    def wifi_devices(self) -> List[str]:
+        """Return the Wi-Fi interface names known to NetworkManager."""
+        result = self._run("-t", "-f", "DEVICE,TYPE", "device", "status", check=False)
+        devices = []
+        for line in result.stdout.splitlines():
+            parts = self._split_terse(line)
+            if len(parts) >= 2 and parts[1] == "wifi":
+                devices.append(parts[0])
+        return devices
+
+    def _require_interface(self):
+        devices = self.wifi_devices()
+        if self.interface in devices:
+            return
+        if devices:
+            raise WiFiError(
+                f"Wi-Fi device '{self.interface}' was not found. "
+                f"Available Wi-Fi devices: {', '.join(devices)}. "
+                "Set WIFI_INTERFACE in the web app service or wdev0 in /etc/accesspopup.conf."
+            )
+        raise WiFiError(
+            f"No Wi-Fi device is available (configured: '{self.interface}'). "
+            "Connect the USB Wi-Fi adapter and check wdev0 in /etc/accesspopup.conf."
+        )
+
     def list_profiles(self) -> List[Dict]:
         result = self._run("-t", "-f", "UUID,NAME,TYPE,AUTOCONNECT-PRIORITY,ACTIVE", "connection", "show")
         profiles = []
@@ -110,6 +135,9 @@ class WiFiManager:
 
     def connect_profile(self, uuid: str) -> Dict:
         profile = self._get_profile(uuid)
+        self._require_interface()
+        # A profile created on a different adapter must follow the configured one.
+        self._run("connection", "modify", "uuid", uuid, "connection.interface-name", self.interface, check=False)
         self._deactivate_ap()
         try:
             self._run(
@@ -146,13 +174,17 @@ class WiFiManager:
         self._run("connection", "delete", "uuid", uuid)
 
     def scan(self, force: bool = False) -> List[Dict]:
+        self._require_interface()
         args = [
             "-t", "-f", "SSID,SIGNAL,SECURITY,IN-USE",
             "device", "wifi", "list",
             "ifname", self.interface,
         ]
         if force:
-            self._run("device", "wifi", "rescan", "ifname", self.interface, timeout=20)
+            # A rescan can be rejected while NetworkManager is busy; the cached
+            # list is still useful, so do not treat this as a failure.
+            self._run("device", "wifi", "rescan", "ifname", self.interface, timeout=20, check=False)
+            time.sleep(1)
 
         result = self._run(*args)
         networks = {}
@@ -216,7 +248,6 @@ class WiFiManager:
         args = [
             "connection", "add",
             "type", "wifi",
-            "ifname", self.interface,
             "con-name", name,
             "ssid", ssid,
         ]
@@ -264,7 +295,7 @@ class WiFiManager:
     def _reactivate_ap(self):
         if not self.ap_connection:
             return
-        # Give NetworkManager a moment to release wlan0 after the failed client attempt.
+        # Give NetworkManager a moment to release the Wi-Fi device after the failed client attempt.
         time.sleep(1)
         self._run("connection", "up", self.ap_connection, "ifname", self.interface, check=False, timeout=20)
 
@@ -298,6 +329,7 @@ class WiFiManager:
         candidate = self.CANDIDATE_NAME
         saved_name = ssid
 
+        self._require_interface()
         self._deactivate_ap()
         try:
             self._create_candidate(ssid, password, candidate)
@@ -306,6 +338,9 @@ class WiFiManager:
             if not ip:
                 raise WiFiError("The network was found, but the Pi did not receive an IP address.")
 
+            # Keep the successful profile on the configured adapter so
+            # NetworkManager does not autoconnect it on the built-in radio.
+            self._run("connection", "modify", candidate, "connection.interface-name", self.interface)
             # Rename the successful profile to the SSID and enable normal autoconnect.
             # The profile is already retained by NetworkManager; we now make it the
             # normal persistent connection.

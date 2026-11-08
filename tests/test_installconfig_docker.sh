@@ -380,6 +380,8 @@ check_install_artifacts() {
 	assert_contains "sudoers allows nmcli" /etc/sudoers.d/apu /usr/bin/nmcli
 	assert_shell "web app files are deployed" '[ -x /usr/local/bin/ap_web/app.py ]'
 	assert_shell "web app virtualenv exists" '[ -x /usr/local/bin/ap_web/venv/bin/python ]'
+	assert_contains "web app uses the configured WiFi device" /etc/systemd/system/ap_web_app.service 'Environment="WIFI_INTERFACE=wlan0"'
+	assert_contains "web app uses the configured AP profile" /etc/systemd/system/ap_web_app.service 'Environment="AP_CONNECTION=AccessPopup"'
 	assert_shell "nginx site is linked" '[ -L /etc/nginx/sites-enabled/accesspopup ]'
 	assert_shell "nginx dispatcher is installed" '[ -x /etc/NetworkManager/dispatcher.d/90-accesspopup-nginx ]'
 	assert_shell "AccessPopup.timer is enabled" 'systemctl is-enabled --quiet AccessPopup.timer'
@@ -433,7 +435,7 @@ eq() {
 	fi
 }
 
-for fn in ap_ip_address add_dnsmasq_shared add_polkit_rule add_cmdline_quiet; do
+for fn in ap_ip_address add_dnsmasq_shared add_polkit_rule add_cmdline_quiet set_config_value set_service_env; do
 	eval "$(sed -n "/^${fn}()/,/^}/p" "$src")"
 done
 
@@ -477,6 +479,33 @@ eq "cmdline quiet is added" \
 eq "cmdline stays a single line" "1" "$(wc -l < "$boot" | tr -d '[:space:]')"
 add_cmdline_quiet >/dev/null
 eq "cmdline quiet is not duplicated" "1" "$(grep -Eow quiet "$boot" | wc -l | tr -d '[:space:]')"
+
+# --- device selection is persisted in accesspopup.conf
+device_conf="$tmp/accesspopup.conf"
+printf "wdev0='wlan0'\nap_ip='192.168.50.1/24'\n" > "$device_conf"
+set_config_value "$device_conf" wdev0 "wlan1"
+eq "config device is replaced" "wdev0='wlan1'" "$(grep -F 'wdev0=' "$device_conf")"
+printf "ap_ip='192.168.50.1/24'\n" > "$device_conf"
+set_config_value "$device_conf" wdev0 "wlan1"
+eq "config device is appended when missing" "wdev0='wlan1'" "$(grep -F 'wdev0=' "$device_conf")"
+
+# --- the web app unit follows the selected device and AP profile
+unit="$tmp/ap_web_app.service"
+cat > "$unit" <<'UNIT'
+[Service]
+Type=simple
+Environment=WIFI_INTERFACE=wlan0
+Environment=AP_CONNECTION=Old AP
+ExecStart=/bin/true
+UNIT
+set_service_env "$unit" WIFI_INTERFACE "wlan1"
+set_service_env "$unit" AP_CONNECTION "AccessPopup"
+eq "service uses the selected device" \
+	'Environment="WIFI_INTERFACE=wlan1"' "$(grep -F 'WIFI_INTERFACE=' "$unit")"
+eq "service quotes the AP profile" \
+	'Environment="AP_CONNECTION=AccessPopup"' "$(grep -F 'AP_CONNECTION=' "$unit")"
+set_service_env "$unit" WIFI_INTERFACE "wlan1"
+eq "service update is idempotent" "1" "$?"
 
 exit $([ "$fails" -eq 0 ] && echo 0 || echo 1)
 EDGE
